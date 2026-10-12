@@ -130,11 +130,7 @@ pub fn looks_like_cpp_project(root: &Path) -> bool {
         .into_iter()
         .filter_entry(should_descend)
         .filter_map(Result::ok)
-        .any(|entry| {
-            entry.path().is_file()
-                && is_cpp_source(entry.path())
-                && is_production_source(entry.path())
-        })
+        .any(|entry| entry.path().is_file() && is_cpp_source(entry.path()))
 }
 
 pub fn collect_cpp_files(root: &Path) -> Vec<PathBuf> {
@@ -156,11 +152,7 @@ pub fn collect_cpp_files(root: &Path) -> Vec<PathBuf> {
         .filter_map(Result::ok)
     {
         let path = entry.path();
-        if !path.is_file()
-            || !is_cpp_source(path)
-            || !is_production_source(path)
-            || is_generated_cpp_artifact(path)
-        {
+        if !path.is_file() || !is_cpp_source(path) || is_generated_cpp_artifact(path) {
             continue;
         }
         let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -192,12 +184,6 @@ fn is_cpp_source(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn is_production_source(path: &Path) -> bool {
-    !path
-        .components()
-        .any(|component| is_ignored_directory_name(&component.as_os_str().to_string_lossy()))
-}
-
 fn is_generated_cpp_artifact(path: &Path) -> bool {
     let name = path
         .file_name()
@@ -207,7 +193,9 @@ fn is_generated_cpp_artifact(path: &Path) -> bool {
 }
 
 fn should_descend(entry: &walkdir::DirEntry) -> bool {
-    !entry.file_type().is_dir() || !is_ignored_directory_name(&entry.file_name().to_string_lossy())
+    entry.depth() == 0
+        || !entry.file_type().is_dir()
+        || !is_ignored_directory_name(&entry.file_name().to_string_lossy())
 }
 
 fn is_ignored_directory_name(name: &str) -> bool {

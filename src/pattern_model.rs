@@ -86,16 +86,30 @@ pub fn build_pattern_context(
     let independently_accessible = colocation_pattern != ColocationPattern::SameObjectFields
         || has_separable_access_partitions(evidence, &locations)
         || has_distinct_access_roles(evidence, &locations);
-    let parallelism_evidence = implicit_parallelism.unwrap_or_else(|| {
-        classify_parallelism(
-            si.is_some_and(|record| record.visibility.is_exposed()),
-            evidence,
-            api_usage,
-            &locations,
-            colocation_pattern,
-            independently_accessible,
-        )
-    });
+    let blocked_shared_api = colocation_pattern == ColocationPattern::SameObjectFields
+        && si.is_some_and(|record| record.known_not_sync)
+        // A public field can be projected into its own shared reference even
+        // when the enclosing object is not Sync.
+        && !si.is_some_and(|record| record.fields.iter().any(|field| field.visibility.is_exposed() && locations.contains(&field.name)))
+        && !si.is_some_and(|record| record.shared_field_projections.iter().any(|field| locations.contains(field)))
+        && !evidence.into_iter().flat_map(|set| &set.evidence).any(|item| {
+            item.field_name.as_ref().is_some_and(|field| locations.contains(field))
+                && (item.in_concurrent_context || item.through_raw_pointer)
+        });
+    let parallelism_evidence = if blocked_shared_api {
+        ParallelismEvidence::Unresolved
+    } else {
+        implicit_parallelism.unwrap_or_else(|| {
+            classify_parallelism(
+                si.is_some_and(|record| record.visibility.is_exposed()),
+                evidence,
+                api_usage,
+                &locations,
+                colocation_pattern,
+                independently_accessible,
+            )
+        })
+    };
     let has_write = implicit_write || has_matching_write(evidence, &locations);
     let distinct_accesses = matching_accessed_locations(evidence, &locations) >= 2
         || (implicit_write && colocation_pattern != ColocationPattern::SameObjectFields);
@@ -127,6 +141,8 @@ fn rust_assumptions(
     let mut assumptions = Vec::new();
     if si.is_some_and(|record| record.layout_source != LayoutSource::RustcExact) {
         assumptions.push("rust_source_layout_is_not_an_abi_guarantee");
+    } else if si.is_some() {
+        assumptions.push("rust_compiler_layout_does_not_determine_object_address");
     }
     if matches!(
         colocation_pattern,

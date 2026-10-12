@@ -12,6 +12,7 @@ mod rust_findings;
 mod rust_macros;
 mod rust_statics;
 mod rust_storage;
+mod rust_thread_safety;
 pub mod rustc_layout;
 pub mod struct_layout;
 pub mod types;

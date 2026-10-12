@@ -7,6 +7,17 @@ use std::path::Path;
 use super::parser::{ParsedCppFile, node_text, walk_nodes};
 use super::types::{CppCompileCommand, CppStructInfo};
 
+#[path = "record_alignment_macros.rs"]
+mod record_alignment_macros;
+
+pub(super) fn type_alignment_wrapper_names(
+    files: &[ParsedCppFile],
+) -> std::collections::HashSet<String> {
+    record_alignment_macros::collect_wrappers(files)
+        .into_keys()
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Value {
     Defined(Option<usize>),
@@ -31,6 +42,7 @@ pub(super) fn apply(
                 .insert(&file.path);
         }
     }
+    record_alignment_macros::apply(files, records, commands, &files_by_path, &definition_files);
     for record in records {
         if record.align_bytes.is_some() {
             continue;

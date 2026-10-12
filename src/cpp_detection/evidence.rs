@@ -978,9 +978,6 @@ impl<'a> EvidenceIndex<'a> {
                 .or_default()
                 .push(idx);
             for field in &record.fields {
-                if field.name.len() < 2 {
-                    continue;
-                }
                 records_by_field
                     .entry(field.name.as_str())
                     .or_default()
@@ -6560,7 +6557,10 @@ fn cache_aligned_receiver_fields(
                 // the stride between elements inside an array/vector field.
                 // Treating those payloads as protected hid per-lcore arrays
                 // embedded in an otherwise cache-aligned control record.
-                if !field.is_array && !super::types::has_contiguous_elements(field) {
+                if !field.is_array
+                    && !field.is_indirect
+                    && !super::types::has_contiguous_elements(field)
+                {
                     protected.insert((receiver.to_string(), field.name.clone()));
                 }
             }

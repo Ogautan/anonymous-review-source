@@ -16,6 +16,7 @@ pub fn collect_cpp_structs(
     cache_line_size: usize,
 ) -> Vec<CppStructInfo> {
     let mut structs = Vec::new();
+    let alignment_wrappers = super::layout_macros::type_alignment_wrapper_names(files);
 
     for file in files {
         if let Some(tree) = &file.tree {
@@ -34,7 +35,9 @@ pub fn collect_cpp_structs(
         // C++ grammar, attribute-heavy C, and macro-decorated declarations).
         // Run the conservative record scanner as a complementary frontend and
         // retain only declarations the syntax tree did not already recover.
-        for fallback in collect_records_fallback(file, project_name, cache_line_size) {
+        for fallback in
+            collect_records_fallback(file, project_name, cache_line_size, &alignment_wrappers)
+        {
             if let Some(record) = structs
                 .iter_mut()
                 .find(|record| record.file == fallback.file && record.name == fallback.name)
@@ -724,6 +727,7 @@ fn collect_records_fallback(
     file: &ParsedCppFile,
     project_name: &str,
     cache_line_size: usize,
+    alignment_wrappers: &std::collections::HashSet<String>,
 ) -> Vec<CppStructInfo> {
     let Ok(record_re) = Regex::new(
         r"(?ms)^[ \t]*(?:typedef[ \t]+)?(struct|class)(?:[ \t]+([A-Za-z_][A-Za-z0-9_:]*))?[^;{]*\{",
@@ -771,6 +775,24 @@ fn collect_records_fallback(
                         close_brace + 1 + name.start(),
                     )
                 })
+            })
+            .or_else(|| {
+                // The C++ grammar can recover `} ATTRIBUTE Alias;` differently
+                // depending on spelling. Recover the typedef identity only for
+                // source-defined type-attribute wrappers; alignment itself is
+                // still resolved separately with visibility/build checks.
+                if !header.as_str().trim_start().starts_with("typedef ") {
+                    return None;
+                }
+                let end = suffix.find(';').filter(|end| *end <= 256)?;
+                let words = suffix[..end].split_whitespace().collect::<Vec<_>>();
+                let [annotation, alias] = words.as_slice() else {
+                    return None;
+                };
+                if !alignment_wrappers.contains(*annotation) {
+                    return None;
+                }
+                Some((alias.to_string(), header.start()))
             });
         let Some((name, name_offset)) = source_name.or(alias_name) else {
             continue;
@@ -2303,7 +2325,7 @@ mod tests {
                 path: "fallback.hpp".into(),
                 source: source.into(),
             }]);
-            let records = collect_records_fallback(&files[0], "fixture", 64);
+            let records = collect_records_fallback(&files[0], "fixture", 64, &Default::default());
             assert_eq!(records.len(), 1, "{source}: {records:#?}");
             assert_eq!(records[0].has_base_classes, inherits, "{source}");
         }

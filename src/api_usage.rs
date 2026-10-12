@@ -740,6 +740,8 @@ mod tests {
             layout_source: LayoutSource::RustDefaultEstimate,
             visibility: ItemVisibility::Public,
             public_fields: Vec::new(),
+            known_not_sync: false,
+            shared_field_projections: Vec::new(),
         }];
         let index = ApiUsageIndex::new(&structs);
         let ty: Type = syn::parse_str("std::sync::Arc<SharedCounters>").unwrap();
@@ -790,6 +792,8 @@ mod tests {
             layout_source: LayoutSource::RustDefaultEstimate,
             visibility: ItemVisibility::Public,
             public_fields: Vec::new(),
+            known_not_sync: false,
+            shared_field_projections: Vec::new(),
         }
     }
 }

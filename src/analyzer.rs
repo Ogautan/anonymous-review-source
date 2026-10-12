@@ -17,7 +17,7 @@ use crate::types::{
     ReportSummary, RiskCategory, StructInfo,
 };
 use crate::workspace::{
-    canonical_path, collect_rs_files, discover_crates, module_path_for_rs_file,
+    canonical_path, collect_rs_sources, discover_crates, module_path_for_rs_file,
 };
 
 /// Main entry point: two-pass analysis with cross-file concurrency evidence.
@@ -62,7 +62,9 @@ pub fn analyze_path_with_options(root: &Path, options: &AnalysisOptions) -> Repo
     let mut parsed_files: Vec<ParsedFile> = Vec::new();
 
     for ci in &crates {
-        for path in collect_rs_files(&ci.root) {
+        let sources = collect_rs_sources(&ci.root);
+        diagnostics.extend(sources.diagnostics);
+        for path in sources.files {
             let canonical_path = canonical_path(&path);
             if !seen_paths.insert(canonical_path.clone()) {
                 continue;
@@ -91,7 +93,11 @@ pub fn analyze_path_with_options(root: &Path, options: &AnalysisOptions) -> Repo
             };
             parsed_files.push(ParsedFile {
                 path: canonical_path.to_string_lossy().to_string(),
-                module_path: module_path_for_rs_file(&ci.root, &path),
+                module_path: sources
+                    .module_paths
+                    .get(&canonical_path)
+                    .cloned()
+                    .unwrap_or_else(|| module_path_for_rs_file(&ci.root, &path)),
                 source,
                 ast,
                 crate_name: Some(ci.name.clone()),
@@ -118,6 +124,7 @@ pub fn analyze_path_with_options(root: &Path, options: &AnalysisOptions) -> Repo
     apply_external_reachability(&parsed_files, &mut all_structs);
 
     enrich_structs_with_type_registry(&mut all_structs, options.cache_line_size);
+    crate::rust_thread_safety::annotate(&parsed_files, &mut all_structs);
 
     if options.use_rustc_layout {
         match collect_rustc_layouts(root) {

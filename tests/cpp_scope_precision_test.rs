@@ -4,6 +4,41 @@ use false_sharing_detector::cpp_detection::parser::parse_cpp_files;
 use false_sharing_detector::cpp_detection::types::{CppEvidenceItem, CppFile};
 use false_sharing_detector::types::RuleId;
 
+#[test]
+fn requested_root_and_ancestors_do_not_change_cpp_discovery() {
+    use false_sharing_detector::cpp_detection::{
+        analyze_cpp_path_with_options, looks_like_cpp_project,
+    };
+    use false_sharing_detector::types::AnalysisOptions;
+    use std::fs;
+    let temporary = tempfile::tempdir().unwrap();
+    for location in [
+        "project",
+        "build/project",
+        "tests/project",
+        "dist",
+        "vendor",
+    ] {
+        let root = temporary.path().join(location);
+        fs::create_dir_all(&root).unwrap();
+        let source = "struct State { std::atomic<int> left; std::atomic<int> right; };\nvoid one(State* s) { s->left.fetch_add(1); }\nvoid two(State* s) { s->right.fetch_add(1); }\nvoid run(State* s) {\nstd::thread a(one,s);\nstd::thread b(two,s);\n}\n";
+        fs::write(root.join("record.cpp"), source).unwrap();
+        for ignored in ["build", "vendor", "tests"] {
+            let directory = root.join(ignored);
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("ignored.cpp"), "not valid C++").unwrap();
+        }
+        assert!(looks_like_cpp_project(&root), "{location}");
+        let report = analyze_cpp_path_with_options(
+            &root,
+            &AnalysisOptions::with_rules(&[RuleId::SameObjectFields]),
+        );
+        assert_eq!(report.scanned_files, 1, "{location}: {report:#?}");
+        assert!(!report.analysis_incomplete, "{report:#?}");
+        assert!(!report.findings.is_empty(), "{location}: {report:#?}");
+    }
+}
+
 fn accesses(body: &str) -> Vec<CppEvidenceItem> {
     let files = parse_cpp_files(vec![CppFile {
         path: "candidate.hpp".into(),

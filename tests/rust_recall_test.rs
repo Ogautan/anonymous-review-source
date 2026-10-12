@@ -4,6 +4,219 @@ use false_sharing_detector::types::AnalysisOptions;
 use false_sharing_detector::types::RuleId;
 use std::fs;
 
+#[test]
+fn cargo_custom_targets_keep_entries_modules_and_logical_module_names() {
+    let source = "use std::sync::{Arc, atomic::{AtomicU64, Ordering}};\npub struct State { left: AtomicU64, right: AtomicU64 }\nimpl State { pub fn one(&self) { self.left.fetch_add(1, Ordering::Relaxed); } pub fn two(&self) { self.right.fetch_add(1, Ordering::Relaxed); } }\npub fn use_state(s: Arc<State>) { s.one(); s.two(); }\n";
+    for (manifest, entry, module) in [
+        ("[lib]\npath = 'lib.rs'", "lib.rs", None),
+        (
+            "[lib]\npath = 'custom/entry.rs'",
+            "custom/entry.rs",
+            Some((
+                "custom/renamed.rs",
+                "#[path = \"renamed.rs\"] pub mod counters;\n",
+            )),
+        ),
+        (
+            "[[bin]]\nname = 'driver'\npath = 'app/driver.rs'",
+            "app/driver.rs",
+            Some(("app/counters.rs", "pub mod counters;\nfn main() {}\n")),
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = 'fixture'\nversion = '0.1.0'\nedition = '2024'\n{manifest}\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(root.path().join(entry).parent().unwrap()).unwrap();
+        if let Some((path, entry_source)) = module {
+            fs::write(root.path().join(entry), entry_source).unwrap();
+            fs::write(root.path().join(path), source).unwrap();
+        } else {
+            fs::write(root.path().join(entry), source).unwrap();
+        }
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(
+            root.path().join("src/unused.rs"),
+            "// Not part of the declared target.\n",
+        )
+        .unwrap();
+        let report = analyze_path_with_options(
+            root.path(),
+            &AnalysisOptions::with_rules(&[RuleId::SameObjectFields]),
+        );
+        assert!(!report.analysis_incomplete, "{report:#?}");
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.struct_name.as_deref() == Some("State"))
+            .expect("custom target should be analyzed");
+        let canonical = &finding.layout_context.as_ref().unwrap().canonical_type;
+        assert_eq!(
+            canonical,
+            if module.is_some() {
+                "counters::State"
+            } else {
+                "State"
+            }
+        );
+    }
+}
+
+#[test]
+fn missing_declared_cargo_target_reports_incomplete_discovery() {
+    let root = setup_test_dir(
+        "missing_target",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.1.0'\n[lib]\npath='absent.rs'\n",
+            ),
+            (
+                "src/unused.rs",
+                "// Existing unrelated source must not hide the missing target.\n",
+            ),
+        ],
+    );
+    let report = analyze_path_with_options(root.path(), &AnalysisOptions::all_rules());
+    assert!(report.analysis_incomplete, "{report:#?}");
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.stage == "discovery"
+                && diagnostic.message.contains("declared Cargo source target"))
+    );
+}
+
+#[test]
+fn shared_api_respects_known_sync_restrictions_and_explicit_overrides() {
+    for (declaration, implementation, expected) in [
+        ("std::cell::Cell<u8>", "", false),
+        ("std::cell::RefCell<u8>", "", false),
+        ("std::cell::UnsafeCell<u8>", "", false),
+        ("std::rc::Rc<u8>", "", false),
+        ("Box<std::cell::Cell<u8>>", "", false),
+        ("std::sync::Mutex<std::cell::Cell<u8>>", "", true),
+        ("Opaque", "", true),
+        (
+            "u8",
+            "#[cfg(feature = \"not_sync\")] impl !Sync for State {}",
+            true,
+        ),
+        ("std::cell::Cell<u8>", "unsafe impl Sync for State {}", true),
+        (
+            "std::cell::Cell<u8>",
+            "#[cfg(feature = \"shared\")] unsafe impl Sync for State {}",
+            true,
+        ),
+        (
+            "std::cell::Cell<u8>",
+            "unsafe impl Send for State {}",
+            false,
+        ),
+        ("u8", "impl !Sync for State {}", false),
+    ] {
+        let source = format!(
+            "use std::sync::{{Arc,atomic::{{AtomicU64,Ordering}}}};\npub struct State {{ left:AtomicU64,right:AtomicU64,private:{declaration} }}\n{implementation}\nimpl State {{pub fn one(&self){{self.left.fetch_add(1,Ordering::Relaxed);}}pub fn two(&self){{self.right.fetch_add(1,Ordering::Relaxed);}}}}\npub fn use_state(s:Arc<State>){{s.one();s.two();}}\n"
+        );
+        let root = setup_test_dir("sync_restrictions", &[("lib.rs", &source)]);
+        let report = analyze_path_with_options(
+            root.path(),
+            &AnalysisOptions::with_rules(&[RuleId::SameObjectFields]),
+        );
+        assert!(!report.analysis_incomplete, "{report:#?}");
+        assert_eq!(
+            !report.findings.is_empty(),
+            expected,
+            "{declaration}, {implementation}: {report:#?}"
+        );
+    }
+}
+
+#[test]
+fn sync_restrictions_follow_imports_aliases_and_local_wrappers() {
+    for (types, payload, expected) in [
+        ("use std::cell::Cell as LocalCell;", "LocalCell<u8>", false),
+        ("use std::cell;", "cell::Cell<u8>", false),
+        ("use std::cell::*;", "Cell<u8>", false),
+        ("type Payload = std::cell::Cell<u8>;", "Payload", false),
+        (
+            "#[cfg(feature = \"local\")] type Payload = std::cell::Cell<u8>; #[cfg(not(feature = \"local\"))] type Payload = u8;",
+            "Payload",
+            true,
+        ),
+        ("struct Payload(std::cell::Cell<u8>);", "Payload", false),
+        (
+            "struct Payload(std::cell::Cell<u8>); unsafe impl Sync for Payload {}",
+            "Payload",
+            true,
+        ),
+        ("struct Cell<T>(T);", "Cell<u8>", true),
+        (
+            "struct Cell<T>(T); type Payload = Cell<u8>;",
+            "Payload",
+            true,
+        ),
+        (
+            "mod custom { pub struct Cell<T>(pub T); }",
+            "custom::Cell<u8>",
+            true,
+        ),
+    ] {
+        let source = format!(
+            "use std::sync::{{Arc,atomic::{{AtomicU64,Ordering}}}};\n{types}\npub struct State{{left:AtomicU64,right:AtomicU64,payload:{payload}}}\nimpl State{{pub fn one(&self){{self.left.fetch_add(1,Ordering::Relaxed);}}pub fn two(&self){{self.right.fetch_add(1,Ordering::Relaxed);}}}}\npub fn use_state(s:Arc<State>){{s.one();s.two();}}\n"
+        );
+        let root = setup_test_dir("sync_bindings", &[("lib.rs", &source)]);
+        let report = analyze_path_with_options(
+            root.path(),
+            &AnalysisOptions::with_rules(&[RuleId::SameObjectFields]),
+        );
+        assert_eq!(
+            !report.findings.is_empty(),
+            expected,
+            "{types}: {report:#?}"
+        );
+    }
+}
+
+#[test]
+fn non_sync_receiver_keeps_concrete_raw_pointer_parallel_accesses() {
+    let source = "use std::sync::atomic::{AtomicU64,Ordering};\npub struct State{left:AtomicU64,right:AtomicU64,payload:std::cell::Cell<u8>}\npub unsafe fn one(s:*const State){unsafe{(*s).left.fetch_add(1,Ordering::Relaxed);}}\npub unsafe fn two(s:*const State){unsafe{(*s).right.fetch_add(1,Ordering::Relaxed);}}\n";
+    let root = setup_test_dir("raw_sync_bypass", &[("lib.rs", source)]);
+    let report = analyze_path_with_options(
+        root.path(),
+        &AnalysisOptions::with_rules(&[RuleId::SameObjectFields]),
+    );
+    assert!(!report.findings.is_empty(), "{report:#?}");
+}
+
+#[test]
+fn non_sync_receiver_can_expose_sync_field_references() {
+    for projection in ["pub left: AtomicU64", "left: AtomicU64"] {
+        let getter = if projection.starts_with("pub") {
+            ""
+        } else {
+            "pub fn left_ref(&self) -> &AtomicU64 { &self.left }"
+        };
+        let source = format!(
+            "use std::sync::{{Arc,atomic::{{AtomicU64,Ordering}}}};\npub struct State{{{projection},right:AtomicU64,private:std::cell::Cell<u8>}}\nimpl State{{pub fn one(&self){{self.left.fetch_add(1,Ordering::Relaxed);}}pub fn two(&self){{self.right.fetch_add(1,Ordering::Relaxed);}}{getter}}}\npub fn use_state(s:Arc<State>){{s.one();s.two();}}\n"
+        );
+        let root = setup_test_dir("field_projection", &[("lib.rs", &source)]);
+        let report = analyze_path_with_options(
+            root.path(),
+            &AnalysisOptions::with_rules(&[RuleId::SameObjectFields]),
+        );
+        assert!(
+            !report.findings.is_empty(),
+            "{projection}, {getter}: {report:#?}"
+        );
+    }
+}
+
 fn setup_test_dir(_name: &str, files: &[(&str, &str)]) -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     for (name, source) in files {

@@ -1038,9 +1038,8 @@ fn apply_atomic_alias_array_rules(
     record: &CppStructInfo,
     evidence: Option<&CppEvidenceSet>,
 ) -> Vec<Finding> {
-    if record.is_cache_aligned {
-        return Vec::new();
-    }
+    // Aligning the enclosing record does not increase an inline array's
+    // element stride. Element alignment is checked independently below.
     let mut findings = Vec::new();
     for field in &record.fields {
         let element = field.element_type.as_deref().unwrap_or(&field.ty_str);
@@ -1667,9 +1666,8 @@ fn assess_container_risk(
     evidence: Option<&CppEvidenceSet>,
     element_name: Option<&str>,
 ) -> Option<CppRiskAssessment> {
-    if record.is_cache_aligned {
-        return None;
-    }
+    // Owner alignment does not isolate elements of an inline array or an
+    // independently allocated backing buffer.
     let evidence = evidence.unwrap_or(&EMPTY_EVIDENCE);
     let api_signal = evidence.has_api_signal() || record.visibility.is_exposed();
     if !evidence.has_evidence() && !api_signal {

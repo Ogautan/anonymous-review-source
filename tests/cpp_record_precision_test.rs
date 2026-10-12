@@ -10,6 +10,52 @@ use false_sharing_detector::types::{AnalysisOptions, CandidateKind};
 use tempfile::tempdir;
 
 #[test]
+fn single_character_fields_keep_typed_access_and_parallel_evidence() {
+    for (left, right) in [("first", "second"), ("x", "y")] {
+        for block in [32, 64, 128] {
+            for protected in [false, true] {
+                let root = tempdir().unwrap();
+                let gap = if protected {
+                    format!("char gap[{block}];")
+                } else {
+                    String::new()
+                };
+                fs::write(root.path().join("record.cpp"), format!(
+                    "#include <atomic>\n#include <thread>\nstruct State {{ std::atomic<int> {left}; {gap} std::atomic<int> {right}; }};\nvoid one(State *s) {{ s->{left}.fetch_add(1); }}\nvoid two(State *s) {{ s->{right}.fetch_add(1); }}\nvoid run(State *s) {{\nstd::thread a(one,s);\nstd::thread b(two,s);\na.join(); b.join();\n}}\n"
+                )).unwrap();
+                let options = AnalysisOptions {
+                    cache_line_size: block,
+                    ..AnalysisOptions::with_rules(&[RuleId::SameObjectFields])
+                };
+                let report = analyze_cpp_path_with_options(root.path(), &options);
+                assert!(!report.analysis_incomplete, "{report:#?}");
+                assert_eq!(
+                    report.findings.is_empty(),
+                    protected,
+                    "{left}/{right}, B={block}: {report:#?}"
+                );
+                for finding in report.findings {
+                    assert!(
+                        finding
+                            .access_evidence
+                            .iter()
+                            .any(|item| item.field_name.as_deref() == Some(left)
+                                && item.in_concurrent_context)
+                    );
+                    assert!(
+                        finding
+                            .access_evidence
+                            .iter()
+                            .any(|item| item.field_name.as_deref() == Some(right)
+                                && item.in_concurrent_context)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn counter_container_names_do_not_suppress_element_record_risks() {
     for field in ["payload", "counter_data"] {
         let root = tempdir().unwrap();
@@ -2267,6 +2313,246 @@ fn source_constant_record_alignment_respects_interference_size_and_build_overrid
             expected,
             "B={size} {flags:?}: {report:#?}"
         );
+    }
+}
+
+#[test]
+fn record_alignment_wrappers_apply_to_the_type_and_respect_block_size() {
+    for (spelling, alias) in [
+        ("ROW_DECORATION", "Slot"),
+        ("another_annotation", "ChangedType"),
+    ] {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("boundary.h"), format!(
+                "#ifndef BOUNDARY_H\n#define BOUNDARY_H\n#if TARGET\n#define BOUNDARY 128\n#else\n#define BOUNDARY 64\n#endif\n#define {spelling} __attribute__((aligned(BOUNDARY)))\n#endif\n"
+            )).unwrap();
+        let declaration =
+            format!("typedef struct {{\nstd::atomic<unsigned> value;\n}} {spelling} {alias};");
+        fs::write(root.path().join("slots.cpp"), format!(
+                "#include \"boundary.h\"\n{declaration}\n{alias} slots[8];\nvoid update(int worker_id) {{ slots[worker_id].value.fetch_add(1); }}\n"
+            )).unwrap();
+        for block in [32, 64, 128] {
+            let report = analyze_cpp_path_with_options(
+                root.path(),
+                &AnalysisOptions {
+                    cache_line_size: block,
+                    ..AnalysisOptions::with_rules(&[RuleId::ContiguousElements])
+                },
+            );
+            assert_eq!(
+                report.findings.is_empty(),
+                block <= 64,
+                "{spelling} {alias}, B={block}: {report:#?}"
+            );
+        }
+    }
+}
+
+fn alignment_wrapper_fixture(
+    header: &str,
+    source: &str,
+    flags: &[&str],
+    block: usize,
+    rules: &[RuleId],
+) -> false_sharing_detector::types::Report {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("boundary.h"), header).unwrap();
+    let file = root.path().join("slots.cpp");
+    fs::write(&file, source).unwrap();
+    let arguments = std::iter::once("clang++")
+        .chain(flags.iter().copied())
+        .chain(["-c", "slots.cpp"])
+        .collect::<Vec<_>>();
+    fs::write(
+        root.path().join("compile_commands.json"),
+        serde_json::json!([{"directory":root.path(),"file":file,"arguments":arguments}])
+            .to_string(),
+    )
+    .unwrap();
+    analyze_cpp_path_with_options(
+        root.path(),
+        &AnalysisOptions {
+            cache_line_size: block,
+            ..AnalysisOptions::with_rules(rules)
+        },
+    )
+}
+
+#[test]
+fn record_alignment_wrapper_defaults_require_visible_unambiguous_macros() {
+    let declaration = "typedef struct {\nstd::atomic<unsigned> value;\n} DECORATE Row;\nRow rows[8];\nvoid update(int worker_id) { rows[worker_id].value.fetch_add(1); }\n";
+    let normal = "#define LIMIT 64\n#define DECORATE __attribute__((aligned(LIMIT)))\n";
+    for block in [32, 64, 128] {
+        for (header, before, include, aligned) in [
+            (normal, "", true, true),
+            (normal, "", false, false),
+            (
+                "#define DECORATE __attribute__((aligned(64)))\n",
+                "",
+                true,
+                true,
+            ),
+            (
+                "#if CONFIG\n#define LIMIT 128\n#else\n#define LIMIT 32\n#endif\n#define DECORATE __attribute__((aligned(LIMIT)))\n",
+                "",
+                true,
+                block <= 32,
+            ),
+            (
+                "#if CONFIG\n#define LIMIT 64\n#endif\n#define DECORATE __attribute__((aligned(LIMIT)))\n",
+                "",
+                true,
+                false,
+            ),
+            (
+                "#define LIMIT 48\n#define DECORATE __attribute__((aligned(LIMIT)))\n",
+                "",
+                true,
+                false,
+            ),
+            (
+                "#define LIMIT UNKNOWN\n#define DECORATE __attribute__((aligned(LIMIT)))\n",
+                "",
+                true,
+                false,
+            ),
+            (normal, "#undef DECORATE\n", true, false),
+            (normal, "#undef LIMIT\n#define LIMIT 16\n", true, false),
+            (
+                normal,
+                "#define DECORATE __attribute__((packed))\n",
+                true,
+                false,
+            ),
+            (
+                "#define LIMIT 64\n#if CONFIG\n#define DECORATE __attribute__((aligned(LIMIT)))\n#endif\n",
+                "",
+                true,
+                false,
+            ),
+            (
+                "#define LIMIT 64\n#if CONFIG\n#define DECORATE __attribute__((aligned(LIMIT)))\n#else\n#define DECORATE\n#endif\n",
+                "",
+                true,
+                false,
+            ),
+            (
+                "/* #define LIMIT 64\n#define DECORATE __attribute__((aligned(LIMIT))) */\n",
+                "",
+                true,
+                false,
+            ),
+            (
+                "#define LIMIT 64\n#define DECORATE __attribute__((aligned(LIMIT),packed))\n",
+                "",
+                true,
+                false,
+            ),
+            (normal, "#define aligned(x) unused\n", true, false),
+        ] {
+            let source = format!(
+                "{}\n{before}{declaration}",
+                if include {
+                    "#include \"boundary.h\""
+                } else {
+                    ""
+                }
+            );
+            let report = alignment_wrapper_fixture(
+                header,
+                &source,
+                &[],
+                block,
+                &[RuleId::ContiguousElements],
+            );
+            assert_eq!(
+                report.findings.is_empty(),
+                aligned && block <= 64,
+                "B={block}, include={include}, {header} {before}: {report:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn record_alignment_wrapper_build_overrides_invalidate_only_relevant_proofs() {
+    let header = "#define LIMIT 64\n#define DECORATE __attribute__((aligned(LIMIT)))\n";
+    let source = "#include \"boundary.h\"\ntypedef struct {\nstd::atomic<unsigned> value;\n} DECORATE Row;\nRow rows[8];\nvoid update(int worker_id) { rows[worker_id].value.fetch_add(1); }\n";
+    for flags in [
+        vec![],
+        vec!["-DUNRELATED=1"],
+        vec!["-DLIMIT=16"],
+        vec!["-D", "LIMIT=16"],
+        vec!["/DLIMIT=16"],
+        vec!["-UDECORATE"],
+        vec!["/U", "DECORATE"],
+        vec!["-D__attribute__(x)="],
+        vec!["-Daligned(x)=unused"],
+        vec!["-Dtypedef="],
+        vec!["-Dstruct="],
+        vec!["-include", "opaque.h"],
+        vec!["-imacrosopaque.h"],
+        vec!["/FIopaque.h"],
+        vec!["@response.rsp"],
+    ] {
+        let report =
+            alignment_wrapper_fixture(header, source, &flags, 64, &[RuleId::ContiguousElements]);
+        assert_eq!(
+            report.findings.is_empty(),
+            flags.is_empty() || flags == ["-DUNRELATED=1"],
+            "{flags:?}: {report:#?}"
+        );
+    }
+}
+
+#[test]
+fn record_alignment_wrappers_preserve_inner_field_and_payload_interference() {
+    let header = "#define DECORATE __attribute__((aligned(128)))\n";
+    for block in [32, 64, 128] {
+        for (body, operations, rule) in [
+            (
+                "std::atomic<unsigned> left;\nstd::atomic<unsigned> right;",
+                "void first(Row* row) { row->left.fetch_add(1); }\nvoid second(Row* row) { row->right.fetch_add(1); }",
+                RuleId::SameObjectFields,
+            ),
+            (
+                "std::atomic<unsigned> values[64];",
+                "void update(Row* row,int worker_id) { row->values[worker_id].fetch_add(1); }",
+                RuleId::ContiguousElements,
+            ),
+            (
+                "unsigned* values;",
+                "void update(Row* row,int worker_id) {\nunsigned* items = row->values;\nitems[worker_id]++;\n}",
+                RuleId::ContiguousElements,
+            ),
+        ] {
+            let source = format!(
+                "#include \"boundary.h\"\ntypedef struct {{\n{body}\n}} DECORATE Row;\n{operations}\n{}\n",
+                if rule == RuleId::SameObjectFields {
+                    "void run(Row* row) {\nstd::thread a(first,row);\nstd::thread b(second,row);\na.join(); b.join();\n}"
+                } else {
+                    "void run(Row* row) {\nstd::thread a(update,row,0);\nstd::thread b(update,row,1);\na.join(); b.join();\n}"
+                }
+            );
+            let report = alignment_wrapper_fixture(header, &source, &[], block, &[rule]);
+            assert!(!report.findings.is_empty(), "B={block} {body}: {report:#?}");
+        }
+    }
+}
+
+#[test]
+fn variable_or_unrelated_instance_alignment_does_not_supply_record_stride() {
+    let header = "#define DECORATE __attribute__((aligned(128)))\n";
+    for declaration in [
+        "typedef struct { std::atomic<unsigned> value; } Row;\nalignas(128) Row rows[8];",
+        "typedef struct { std::atomic<unsigned> value; } Row;\nstruct { std::atomic<unsigned> value; } DECORATE unrelated;\nRow rows[8];",
+    ] {
+        let source = format!(
+            "#include \"boundary.h\"\n{declaration}\nvoid update(int worker_id) {{ rows[worker_id].value.fetch_add(1); }}\n"
+        );
+        let report =
+            alignment_wrapper_fixture(header, &source, &[], 64, &[RuleId::ContiguousElements]);
+        assert!(!report.findings.is_empty(), "{declaration}: {report:#?}");
     }
 }
 

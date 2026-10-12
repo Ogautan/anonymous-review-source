@@ -748,8 +748,10 @@ fn cpp_protection_excluded(
     if record.is_some_and(|record| {
         (record.is_cache_aligned
             && topology != ColocationPattern::SameObjectFields
+            && topology != ColocationPattern::ContiguousElements
             && !record.fields.iter().any(|field| {
-                fields.contains(field.name.as_str()) && has_contiguous_elements(field)
+                fields.contains(field.name.as_str())
+                    && (has_contiguous_elements(field) || field.is_indirect)
             }))
             || record.fields.iter().any(|field| {
                 fields.contains(field.name.as_str())

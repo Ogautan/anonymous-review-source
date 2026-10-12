@@ -140,6 +140,8 @@ pub fn analyze_struct_layout(
         layout_source,
         visibility: item_visibility(&item_struct.vis),
         public_fields,
+        known_not_sync: false,
+        shared_field_projections: Vec::new(),
     }
 }
 
@@ -495,22 +497,30 @@ fn rustc_layout_matches_fields(si: &StructInfo, layout: &RustcTypeLayout) -> boo
 }
 
 fn compute_offset_groups(layout: &RustcTypeLayout, cache_line_size: usize) -> Vec<Vec<String>> {
-    let mut by_line: HashMap<usize, Vec<String>> = HashMap::new();
-    for field in &layout.fields {
-        let start_line = field.offset / cache_line_size;
-        let end_line = if field.size == 0 {
-            start_line
-        } else {
-            (field.offset + field.size - 1) / cache_line_size
-        };
-        for line in start_line..=end_line {
-            by_line.entry(line).or_default().push(field.name.clone());
-        }
+    // Compiler offsets are relative to an object whose base need not coincide
+    // with a cache-block boundary. Retain a group for every possible base
+    // phase allowed by the compiler's actual alignment.
+    let mut alignment = layout.alignment.max(1);
+    let mut granularity = cache_line_size;
+    while granularity != 0 {
+        (alignment, granularity) = (granularity, alignment % granularity);
     }
-
-    let mut lines: Vec<_> = by_line.into_iter().collect();
-    lines.sort_by_key(|(line, _)| *line);
-    lines.into_iter().map(|(_, fields)| fields).collect()
+    let mut groups = Vec::new();
+    for phase in (0..cache_line_size).step_by(alignment) {
+        let mut by_line: HashMap<usize, Vec<String>> = HashMap::new();
+        for field in layout.fields.iter().filter(|field| field.size > 0) {
+            let start = field.offset.saturating_add(phase);
+            let start_line = start / cache_line_size;
+            let end_line = start.saturating_add(field.size - 1) / cache_line_size;
+            for line in start_line..=end_line {
+                by_line.entry(line).or_default().push(field.name.clone());
+            }
+        }
+        groups.extend(by_line.into_values());
+    }
+    groups.sort();
+    groups.dedup();
+    groups
 }
 
 fn compute_cache_line_groups(
@@ -1001,6 +1011,54 @@ pub(crate) fn collect_structs_from_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiler_offsets_account_for_every_alignment_allowed_base_phase() {
+        use crate::rustc_layout::RustcFieldLayout;
+        for block in [32usize, 64, 128] {
+            for (alignment, isolated) in [(8, false), (block, true)] {
+                let layout = RustcTypeLayout {
+                    type_name: "State".into(),
+                    total_size: (block + 8).div_ceil(alignment) * alignment,
+                    alignment,
+                    fields: vec![
+                        RustcFieldLayout {
+                            name: "left".into(),
+                            offset: block - 8,
+                            size: 8,
+                            alignment: Some(8),
+                        },
+                        RustcFieldLayout {
+                            name: "right".into(),
+                            offset: block,
+                            size: 8,
+                            alignment: Some(8),
+                        },
+                        RustcFieldLayout {
+                            name: "empty".into(),
+                            offset: block,
+                            size: 0,
+                            alignment: Some(1),
+                        },
+                    ],
+                };
+                let groups = compute_offset_groups(&layout, block);
+                let shared = groups.iter().any(|group| {
+                    group.iter().any(|field| field == "left")
+                        && group.iter().any(|field| field == "right")
+                });
+                assert_eq!(
+                    shared, !isolated,
+                    "B={block}, alignment={alignment}: {groups:?}"
+                );
+                assert!(
+                    groups
+                        .iter()
+                        .all(|group| !group.iter().any(|field| field == "empty"))
+                );
+            }
+        }
+    }
 
     #[test]
     fn conditional_alignment_requires_coverage_of_every_cfg_branch() {

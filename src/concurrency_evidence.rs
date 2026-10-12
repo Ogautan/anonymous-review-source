@@ -1439,7 +1439,7 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
         if cfg_is_test_only(&node.attrs) {
             return;
         }
-        if let Some((_, trait_path, _)) = &node.trait_
+        if let Some((None, trait_path, _)) = &node.trait_
             && trait_path.segments.last().is_some_and(|segment| {
                 matches!(segment.ident.to_string().as_str(), "Send" | "Sync")
             })

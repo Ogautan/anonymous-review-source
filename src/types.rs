@@ -322,6 +322,7 @@ pub struct LayoutContext {
     pub layout_certainty: String,
     pub fields: Vec<LayoutFieldContext>,
     pub cache_line_groups: Vec<Vec<String>>,
+    /// Compiler-backed groups include every phase allowed by object alignment.
     pub cache_line_groups_precise: bool,
     pub repr_c: bool,
     pub repr_rust: bool,
@@ -652,6 +653,10 @@ pub struct StructInfo {
     pub layout_source: LayoutSource,
     pub visibility: ItemVisibility,
     pub public_fields: Vec<String>,
+    /// Source-proven failure of Sync; opaque types remain unresolved.
+    pub known_not_sync: bool,
+    /// API projections of shared field references, not memory-access witnesses.
+    pub shared_field_projections: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
