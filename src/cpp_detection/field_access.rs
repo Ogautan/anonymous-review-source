@@ -1,6 +1,7 @@
 //! Source syntax facts for member accesses. These are deliberately not ABI or
 //! whole-program ownership proofs: they bind an occurrence to its lexical
 //! declaration, mutation target, and enclosing function before heuristics run.
+use crate::cpp_detection::parser::CodeChildren;
 
 use super::*;
 use tree_sitter::Node;
@@ -193,7 +194,7 @@ pub(super) fn propagate_shared_method_context(
                 "for_statement" | "for_range_loop" | "while_statement" | "do_statement"
             );
             let mut cursor = node.walk();
-            pending.extend(node.named_children(&mut cursor));
+            pending.extend(node.named_code_children(&mut cursor));
         }
         if !repeated {
             return;
@@ -802,7 +803,7 @@ pub(super) fn record_construction_is_inert(
         }
         inert = true;
         let mut cursor = body.walk();
-        for field in body.named_children(&mut cursor) {
+        for field in body.named_code_children(&mut cursor) {
             if matches!(field.kind(), "field_declaration" | "declaration") {
                 walk_nodes(field, &mut |part| {
                     if matches!(
@@ -1075,7 +1076,7 @@ fn receiver_identifier(mut node: Node<'_>, source: &str) -> Option<String> {
         match node.kind() {
             "identifier" | "this" => return Some(node_text(node, source).to_string()),
             "subscript_expression" => node = node.child_by_field_name("argument")?,
-            "parenthesized_expression" | "pointer_expression" => node = node.named_child(0)?,
+            "parenthesized_expression" | "pointer_expression" => node = node.named_code_child(0)?,
             _ => return None,
         }
     }
@@ -1116,9 +1117,14 @@ fn expression_record(
             fallback,
             owner,
         ),
-        "parenthesized_expression" | "pointer_expression" => {
-            expression_record(node.named_child(0)?, file, index, bindings, fallback, owner)
-        }
+        "parenthesized_expression" | "pointer_expression" => expression_record(
+            node.named_code_child(0)?,
+            file,
+            index,
+            bindings,
+            fallback,
+            owner,
+        ),
         "field_expression" => {
             let parent = expression_record(
                 node.child_by_field_name("argument")?,
@@ -1297,7 +1303,7 @@ fn expression_is_atomic(
                 // Only the atomic object's argument supplies atomic-state
                 // evidence, not the desired value, output or expected value.
                 return (address || !outer.contains('*'))
-                    && parent.named_child(0) == Some(node)
+                    && parent.named_code_child(0) == Some(node)
                     && parent
                         .parent()
                         .and_then(|call| call.child_by_field_name("function"))
@@ -1383,7 +1389,7 @@ fn expression_access_kind(
                         && field.is_atomic
                         && call
                             .child_by_field_name("arguments")
-                            .and_then(|args| args.named_child(0))
+                            .and_then(|args| args.named_code_child(0))
                             .is_some_and(|value| {
                                 expression_depends_on_lvalue(value, node, source, 4)
                             })
@@ -1430,13 +1436,13 @@ fn expression_access_kind(
                     let name = node_text(callee, source);
                     let mut cursor = parent.walk();
                     if let Some(argument) = parent
-                        .named_children(&mut cursor)
+                        .named_code_children(&mut cursor)
                         .position(|arg| arg == node)
                         && let Some(kind) = explicit_atomic_argument_access(name, argument)
                     {
                         return kind;
                     }
-                    if parent.named_child(0) == Some(node) {
+                    if parent.named_code_child(0) == Some(node) {
                         if let Some(kind) =
                             macro_field_mutation(node_text(call, source), &field.name)
                         {
@@ -1468,8 +1474,8 @@ fn standard_guard_acquires_argument(mut node: Node<'_>, source: &str) -> bool {
             continue;
         }
         if !matches!(parent.kind(), "argument_list" | "initializer_list")
-            || parent.named_child_count() != 1
-            || parent.named_child(0) != Some(node)
+            || parent.named_code_child_count() != 1
+            || parent.named_code_child(0) != Some(node)
         {
             return false;
         }
@@ -1516,9 +1522,9 @@ fn ambiguous_guard_constructor_argument(node: Node<'_>, source: &str) -> bool {
             let Some(parameters) = parent.parent().filter(|n| n.kind() == "parameter_list") else {
                 return false;
             };
-            if parameters.named_child_count() != 1
+            if parameters.named_code_child_count() != 1
                 || !parameters
-                    .named_children(&mut parameters.walk())
+                    .named_code_children(&mut parameters.walk())
                     .any(|parameter| parameter == parent)
             {
                 return false;
@@ -1652,7 +1658,7 @@ fn expression_depends_on_lvalue(rhs: Node<'_>, lhs: Node<'_>, source: &str, dept
             }
             if block.kind() == "compound_statement" {
                 let mut declaration = None;
-                for statement in block.named_children(&mut block.walk()) {
+                for statement in block.named_code_children(&mut block.walk()) {
                     if statement.end_byte() > use_node.start_byte()
                         || statement.kind() != "declaration"
                     {
@@ -1738,7 +1744,7 @@ fn contiguous_element_index(mut node: Node<'_>, source: &str) -> Option<String> 
     let index = if parent.kind() == "subscript_expression"
         && parent.child_by_field_name("argument") == Some(node)
     {
-        parent.child_by_field_name("indices")?.named_child(0)?
+        parent.child_by_field_name("indices")?.named_code_child(0)?
     } else if parent.kind() == "field_expression"
         && parent.child_by_field_name("argument") == Some(node)
         && parent
@@ -1746,10 +1752,10 @@ fn contiguous_element_index(mut node: Node<'_>, source: &str) -> Option<String> 
             .is_some_and(|n| node_text(n, source) == "at")
     {
         let arguments = parent.parent()?.child_by_field_name("arguments")?;
-        if arguments.named_child_count() != 1 {
+        if arguments.named_code_child_count() != 1 {
             return None;
         }
-        arguments.named_child(0)?
+        arguments.named_code_child(0)?
     } else {
         return None;
     };
@@ -2063,7 +2069,7 @@ fn address_without_memory_access(
         {
             let mut cursor = parent.walk();
             if let Some(argument) = parent
-                .named_children(&mut cursor)
+                .named_code_children(&mut cursor)
                 .position(|arg| arg == node)
                 && explicit_atomic_argument_access(node_text(callee, source), argument).is_some()
             {

@@ -2,6 +2,7 @@
 //! the new handle. Re-evaluate that assignment with only its callback masked,
 //! preserving any genuinely parallel enclosing callable or loop.
 use super::*;
+use crate::cpp_detection::parser::CodeChildren;
 
 pub(super) fn serial_indexed_assignments(
     file: &ParsedCppFile,
@@ -36,7 +37,7 @@ pub(super) fn serial_indexed_assignments(
         }
         let Some(callback) = right
             .child_by_field_name("arguments")
-            .and_then(|args| args.named_child(0))
+            .and_then(|args| args.named_code_child(0))
         else {
             return;
         };

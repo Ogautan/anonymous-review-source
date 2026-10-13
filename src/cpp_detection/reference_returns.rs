@@ -1,5 +1,6 @@
 //! Bounded direct reference getters. Unsupported uses retain the old may facts.
 use super::*;
+use crate::cpp_detection::parser::CodeChildren;
 
 #[derive(Clone)]
 struct Getter {
@@ -64,19 +65,19 @@ impl ReferenceReturns {
                     return;
                 }
                 let Some(function) = declarator
-                    .named_child(0)
+                    .named_code_child(0)
                     .filter(|n| n.kind() == "function_declarator")
                 else {
                     return;
                 };
                 if function
                     .child_by_field_name("parameters")
-                    .is_none_or(|p| p.named_child_count() != 0)
+                    .is_none_or(|p| p.named_code_child_count() != 0)
                 {
                     return;
                 }
                 let statements = body
-                    .named_children(&mut body.walk())
+                    .named_code_children(&mut body.walk())
                     .filter(|n| n.kind() != "comment")
                     .collect::<Vec<_>>();
                 let [statement] = statements.as_slice() else {
@@ -85,11 +86,11 @@ impl ReferenceReturns {
                 if statement.kind() != "return_statement" {
                     return;
                 }
-                let Some(mut value) = statement.named_child(0) else {
+                let Some(mut value) = statement.named_code_child(0) else {
                     return;
                 };
                 while value.kind() == "parenthesized_expression" {
-                    let Some(inner) = value.named_child(0) else {
+                    let Some(inner) = value.named_code_child(0) else {
                         return;
                     };
                     value = inner;
@@ -321,7 +322,7 @@ pub(super) fn collect_uses(
             || inside_error(call)
             || call
                 .child_by_field_name("arguments")
-                .is_none_or(|a| a.named_child_count() != 0)
+                .is_none_or(|a| a.named_code_child_count() != 0)
         {
             block();
             return;

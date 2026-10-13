@@ -111,6 +111,24 @@ fn root_cause_key(root: &Path, finding: &Finding) -> RootCauseKey {
             object.push('|');
             object.push_str(&component);
         }
+        // Element pairs in separate container fields refer to separate
+        // backing storage. Merging them would retain only one pair witness
+        // while claiming fields from the other storage domains as well.
+        if finding.static_pattern.as_ref().is_some_and(|pattern| {
+            pattern.colocation_pattern == ColocationPattern::ContiguousElements
+        }) {
+            let mut fields: Vec<_> = finding
+                .field_list
+                .iter()
+                // An element-member path and its containing sequence name
+                // designate the same backing storage, unlike another field.
+                .map(|field| field.split('[').next().unwrap_or(field).to_string())
+                .collect();
+            fields.sort();
+            fields.dedup();
+            object.push_str("|elements:");
+            object.push_str(&fields.join("+"));
+        }
         let normalized_storage_identity = finding
             .storage_identity
             .as_deref()

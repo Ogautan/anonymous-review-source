@@ -3,6 +3,7 @@
 //! methods retain their own possible entry; they are never declared safe.
 use super::super::types::{CppMethodRole, CppRecordKind};
 use super::*;
+use crate::cpp_detection::parser::CodeChildren;
 use tree_sitter::Node;
 
 #[derive(Default)]
@@ -118,9 +119,9 @@ impl Builder {
                     } else if matches!(
                         current.kind(),
                         "parenthesized_declarator" | "reference_declarator"
-                    ) && current.named_child_count() == 1
+                    ) && current.named_code_child_count() == 1
                     {
-                        current = current.named_child(0).unwrap();
+                        current = current.named_code_child(0).unwrap();
                     } else {
                         break;
                     }
@@ -165,7 +166,7 @@ impl Builder {
             {
                 let mut argument = node.child_by_field_name("argument");
                 while argument.is_some_and(|arg| arg.kind() == "parenthesized_expression") {
-                    argument = argument.and_then(|arg| arg.named_child(0));
+                    argument = argument.and_then(|arg| arg.named_code_child(0));
                 }
                 // The address of a lexically bound local/parameter cannot be
                 // a same-spelled member function. Preserve qualified member
@@ -487,7 +488,7 @@ impl Builder {
             self.open_records.insert(owner);
         }
         let mut private = record.kind == CppRecordKind::Class;
-        for child in body.named_children(&mut body.walk()) {
+        for child in body.named_code_children(&mut body.walk()) {
             if child.kind() == "access_specifier" {
                 private = node_text(child, &file.source) == "private";
                 continue;
@@ -694,7 +695,7 @@ fn preserves_entry_locks(
     if declarator.kind() != "function_declarator"
         || declarator
             .child_by_field_name("parameters")
-            .is_none_or(|parameters| parameters.named_child_count() != 0)
+            .is_none_or(|parameters| parameters.named_code_child_count() != 0)
         || node
             .child_by_field_name("type")
             .is_none_or(|ty| !matches!(ty.kind(), "primitive_type" | "sized_type_specifier"))
@@ -843,8 +844,8 @@ fn is_self_receiver(mut node: Node<'_>) -> bool {
     loop {
         match node.kind() {
             "this" => return true,
-            "parenthesized_expression" if node.named_child_count() == 1 => {
-                node = node.named_child(0).unwrap();
+            "parenthesized_expression" if node.named_code_child_count() == 1 => {
+                node = node.named_code_child(0).unwrap();
             }
             "pointer_expression"
                 if !dereferenced
@@ -896,7 +897,7 @@ fn receiver_may_escape(
         {
             let mut argument = node.child_by_field_name("argument");
             while argument.is_some_and(|arg| arg.kind() == "parenthesized_expression") {
-                argument = argument.and_then(|arg| arg.named_child(0));
+                argument = argument.and_then(|arg| arg.named_code_child(0));
             }
             // Taking an independent primitive local's address publishes no
             // receiver storage. Pointer/reference/record aliases remain open.

@@ -2,6 +2,7 @@
 //! scalar formals need provenance from a bound caller, unless the callable
 //! escapes (for example as a thread entry point) or lookup is ambiguous.
 use super::*;
+use crate::cpp_detection::parser::CodeChildren;
 use std::borrow::Cow;
 use tree_sitter::Node;
 
@@ -16,10 +17,10 @@ struct Function {
 }
 
 fn closed_body(body: Node<'_>) -> bool {
-    body.child(0)
+    body.code_child(0)
         .is_some_and(|n| n.kind() == "{" && !n.is_missing())
         && body
-            .child(body.child_count().saturating_sub(1) as u32)
+            .code_child(body.code_child_count().saturating_sub(1) as u32)
             .is_some_and(|n| n.kind() == "}" && !n.is_missing())
 }
 
@@ -89,7 +90,7 @@ fn scalar_parameter(parameter: Node<'_>, source: &str) -> Option<String> {
 
 fn signature(parameters: Node<'_>, source: &str) -> Vec<String> {
     parameters
-        .named_children(&mut parameters.walk())
+        .named_code_children(&mut parameters.walk())
         .filter(|p| p.kind() != "comment")
         .map(|p| {
             let ty = p
@@ -107,7 +108,7 @@ fn signature(parameters: Node<'_>, source: &str) -> Vec<String> {
 
 fn integral_argument(mut node: Node<'_>, source: &str) -> bool {
     while node.kind() == "parenthesized_expression" {
-        let Some(inner) = node.named_child(0) else {
+        let Some(inner) = node.named_code_child(0) else {
             return false;
         };
         node = inner;
@@ -126,7 +127,7 @@ fn integral_argument(mut node: Node<'_>, source: &str) -> bool {
     while let Some(scope) = parent {
         if scope.kind() == "compound_statement" {
             for declaration in scope
-                .named_children(&mut scope.walk())
+                .named_code_children(&mut scope.walk())
                 .filter(|n| n.kind() == "declaration" && n.end_byte() < node.start_byte())
             {
                 for declarator in
@@ -146,7 +147,7 @@ fn integral_argument(mut node: Node<'_>, source: &str) -> bool {
                 return false;
             };
             return parameters
-                .named_children(&mut parameters.walk())
+                .named_code_children(&mut parameters.walk())
                 .any(|p| scalar_parameter(p, source).as_deref() == Some(name));
         }
         parent = scope.parent();
@@ -203,11 +204,11 @@ pub(super) fn prepare(file: &ParsedCppFile, origins: &mut IndexPartitionOrigins)
             return;
         }
         let parameters = params
-            .named_children(&mut params.walk())
+            .named_code_children(&mut params.walk())
             .filter(|p| p.kind() != "comment")
             .map(|p| scalar_parameter(p, &file.source))
             .collect::<Vec<_>>();
-        let explicit_static = node.named_children(&mut node.walk()).any(|child| {
+        let explicit_static = node.named_code_children(&mut node.walk()).any(|child| {
             child.kind() == "storage_class_specifier" && node_text(child, &file.source) == "static"
         });
         definitions.entry(name.clone()).or_default().push(Function {
@@ -309,7 +310,7 @@ pub(super) fn prepare(file: &ParsedCppFile, origins: &mut IndexPartitionOrigins)
             return;
         };
         let arguments = arguments
-            .named_children(&mut arguments.walk())
+            .named_code_children(&mut arguments.walk())
             .filter(|a| a.kind() != "comment")
             .map(|a| {
                 if !function.pointer_overload_signatures.is_empty()

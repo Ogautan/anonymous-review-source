@@ -10,6 +10,217 @@ use false_sharing_detector::types::{AnalysisOptions, CandidateKind};
 use tempfile::tempdir;
 
 #[test]
+fn original_syntax_recovery_keeps_a_qualified_embedded_atomic_type() {
+    // Conditional directives split both the constructor's parameter and
+    // initializer lists. The original comment lets tree-sitter recover the
+    // class; parsing a comment-masked copy loses that class and its namespace.
+    let source = concat!(
+        "#include <atomic>\n#include <cstdint>\nnamespace grpc_core {\n",
+        "class RefCount {\n public:\n  using Value = intptr_t;\n\n",
+        "  // `init` is the initial refcount stored in this object.\n  //\n",
+        "  // `trace` is a string to be logged with trace events; if null, no\n",
+        "  // trace logging will be done.  Tracing is a no-op in non-debug builds.\n",
+        "  explicit RefCount(\n      Value init = 1,\n      const char*\n",
+        "#ifndef NDEBUG\n",
+        "          // Leave unnamed if NDEBUG to avoid unused parameter warning\n",
+        "          trace\n#endif\n      = nullptr)\n      :\n",
+        "#ifndef NDEBUG\n        trace_(trace),\n#endif\n        value_(init) {\n  }\n",
+        "\nprivate:\n const char* trace_;\n std::atomic<Value> value_{0};\n};\n}\n",
+        "struct Holder { grpc_core::RefCount refs; std::atomic<int> peer; };\n",
+    );
+    for block in [32, 64, 128] {
+        let files = parse_cpp_files(vec![CppFile {
+            path: "recovery.hpp".into(),
+            source: source.into(),
+        }]);
+        assert_eq!(files[0].source.len(), source.len());
+        assert!(!files[0].source.contains("Leave unnamed"));
+        assert_eq!(files[0].source.find("value_{0}"), source.find("value_{0}"));
+        // The unresolved preprocessor grammar still warrants diagnostics.
+        assert!(files[0].tree.as_ref().unwrap().root_node().has_error());
+        let records = collect_cpp_structs(&files, "fixture", block);
+        let inner = records
+            .iter()
+            .find(|record| record.qualified_name == "grpc_core::RefCount")
+            .expect("syntax recovery must retain the namespace");
+        assert!(inner.fields.iter().any(|field| field.is_atomic));
+        assert!(inner.public_methods.contains(&"RefCount".to_string()));
+        let holder = records
+            .iter()
+            .find(|record| record.name == "Holder")
+            .unwrap();
+        let field = holder
+            .fields
+            .iter()
+            .find(|field| field.name == "refs")
+            .unwrap();
+        assert!(field.is_hot_sync, "{holder:#?}");
+        assert!(field.estimated_size.is_some(), "{holder:#?}");
+    }
+}
+
+#[test]
+fn member_alignment_does_not_pad_its_scalar_storage() {
+    for block in [32, 64, 128] {
+        for (first_alignment, second_alignment, separated) in [
+            (String::new(), String::new(), false),
+            (format!("alignas({block})"), String::new(), false),
+            (String::new(), format!("alignas({block})"), true),
+            (
+                format!("alignas({block})"),
+                format!("alignas({block})"),
+                true,
+            ),
+        ] {
+            let source = format!(
+                "#include <atomic>\n#include <thread>\nstruct State {{ {first_alignment} std::atomic<int> first; {second_alignment} std::atomic<int> second; }};\nvoid one(State *s) {{ s->first.fetch_add(1); }}\nvoid two(State *s) {{ s->second.fetch_add(1); }}\nvoid run(State *s) {{\nstd::thread a(one,s);\nstd::thread b(two,s);\na.join(); b.join(); }}"
+            );
+            let root = tempdir().unwrap();
+            fs::write(root.path().join("record.cpp"), &source).unwrap();
+            let files = parse_cpp_files(vec![CppFile {
+                path: "record.cpp".into(),
+                source: source.clone(),
+            }]);
+            let records = collect_cpp_structs(&files, "fixture", block);
+            let state = records
+                .iter()
+                .find(|record| record.name == "State")
+                .unwrap();
+            assert!(
+                state
+                    .fields
+                    .iter()
+                    .all(|field| field.estimated_size == Some(4)),
+                "{state:#?}"
+            );
+            assert_eq!(state.fields[0].offset, Some(0));
+            assert_eq!(
+                state.fields[1].offset,
+                Some(if separated { block } else { 4 })
+            );
+            let report = analyze_cpp_path_with_options(
+                root.path(),
+                &AnalysisOptions {
+                    cache_line_size: block,
+                    ..AnalysisOptions::with_rules(&[RuleId::SameObjectFields])
+                },
+            );
+            assert!(!report.analysis_incomplete, "{report:#?}");
+            assert_eq!(
+                report.findings.is_empty(),
+                separated,
+                "B={block}: {source}\n{report:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn alignment_words_in_a_member_name_do_not_supply_an_attribute() {
+    for name in ["second", "alignas_counter", "aligned_counter"] {
+        let source = format!(
+            "#include <atomic>\n#include <thread>\nint make_value(int);\nstruct State {{ std::atomic<int> first; std::atomic<int> {name}{{make_value(64)}}; }};\nvoid one(State *s) {{ s->first.fetch_add(1); }}\nvoid two(State *s) {{ s->{name}.fetch_add(1); }}\nvoid run(State *s) {{ std::thread a(one,s); std::thread b(two,s); a.join(); b.join(); }}"
+        );
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("record.cpp"), &source).unwrap();
+        let files = parse_cpp_files(vec![CppFile {
+            path: "record.cpp".into(),
+            source,
+        }]);
+        let records = collect_cpp_structs(&files, "fixture", 64);
+        let state = records
+            .iter()
+            .find(|record| record.name == "State")
+            .unwrap();
+        let second = state
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .unwrap();
+        assert_eq!(second.offset, Some(4), "{state:#?}");
+        assert_eq!(second.align_bytes, None, "{state:#?}");
+        let report = analyze_cpp_path_with_options(
+            root.path(),
+            &AnalysisOptions::with_rules(&[RuleId::SameObjectFields]),
+        );
+        assert!(!report.findings.is_empty(), "{report:#?}");
+    }
+}
+
+#[test]
+fn comments_literals_and_initializers_cannot_supply_member_alignment() {
+    for block in [32, 64, 128] {
+        for declaration in [
+            format!("std::atomic<int> second /* alignas({block}) */;"),
+            format!("std::atomic<int> second{{aligned({block})}};"),
+            format!("std::atomic<int> second{{make_value(\"alignas({block})\")}};"),
+            format!("std::atomic<int> second{{make_value(R\"tag(aligned({block}))tag\")}};"),
+            format!(
+                "std::atomic<int> second{{[] {{ alignas({block}) int value = 0; return value; }}()}};"
+            ),
+            "std::atomic<int> second{[] { static int value = 0; return value; }()};".to_string(),
+            "std::atomic<int> second{sizeof(const int)};".to_string(),
+            "[[deprecated(\"const static\")]] std::atomic<int> second;".to_string(),
+        ] {
+            let root = tempdir().unwrap();
+            let source = format!(
+                "#include <atomic>\n#include <thread>\nint aligned(int); int make_value(const char*);\nstruct State {{ std::atomic<int> first; {declaration} }};\nvoid one(State *s) {{ s->first.fetch_add(1); }}\nvoid two(State *s) {{ s->second.fetch_add(1); }}\nvoid run(State *s) {{ std::thread a(one,s); std::thread b(two,s); a.join(); b.join(); }}"
+            );
+            fs::write(root.path().join("record.cpp"), &source).unwrap();
+            let files = parse_cpp_files(vec![CppFile {
+                path: "record.cpp".into(),
+                source: source.clone(),
+            }]);
+            let records = collect_cpp_structs(&files, "fixture", block);
+            let state = records
+                .iter()
+                .find(|record| record.name == "State")
+                .unwrap();
+            assert_eq!(state.fields[1].align_bytes, None, "{state:#?}");
+            assert!(!state.fields[1].is_static, "{state:#?}");
+            assert!(state.fields[1].is_atomic, "{state:#?}");
+            assert_eq!(state.fields[1].offset, Some(4), "{state:#?}");
+            let report = analyze_cpp_path_with_options(
+                root.path(),
+                &AnalysisOptions {
+                    cache_line_size: block,
+                    ..AnalysisOptions::with_rules(&[RuleId::SameObjectFields])
+                },
+            );
+            assert!(!report.analysis_incomplete, "{report:#?}");
+            assert!(!report.findings.is_empty(), "{source}\n{report:#?}");
+        }
+    }
+}
+
+#[test]
+fn actual_member_qualifiers_are_retained() {
+    let files = parse_cpp_files(vec![CppFile {
+        path: "record.cpp".into(),
+        source: "#include <atomic>\nstruct State { static std::atomic<int> shared; const std::atomic<int> frozen{0}; std::atomic<int> live; };".into(),
+    }]);
+    let records = collect_cpp_structs(&files, "fixture", 64);
+    let state = records
+        .iter()
+        .find(|record| record.name == "State")
+        .unwrap();
+    assert_eq!(state.static_fields.len(), 1, "{state:#?}");
+    assert_eq!(state.static_fields[0].name, "shared");
+    let frozen = state
+        .fields
+        .iter()
+        .find(|field| field.name == "frozen")
+        .unwrap();
+    assert!(!frozen.is_atomic);
+    let live = state
+        .fields
+        .iter()
+        .find(|field| field.name == "live")
+        .unwrap();
+    assert!(live.is_atomic);
+}
+
+#[test]
 fn single_character_fields_keep_typed_access_and_parallel_evidence() {
     for (left, right) in [("first", "second"), ("x", "y")] {
         for block in [32, 64, 128] {

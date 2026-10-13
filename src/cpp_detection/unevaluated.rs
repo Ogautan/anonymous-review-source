@@ -1,5 +1,6 @@
 //! Runtime-only source views. Layout/type recovery keeps the original source;
 //! operand bytes hidden here never become a fabricated constant expression.
+use crate::cpp_detection::parser::CodeChildren;
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -143,7 +144,10 @@ pub(super) fn views<'a>(
             let range = if node.kind() == "requires_expression" {
                 // Requirement parameters and requirement bodies exist only
                 // for constraint checking, not in a runtime invocation.
-                let Some(keyword) = node.child(0).filter(|token| token.kind() == "requires") else {
+                let Some(keyword) = node
+                    .code_child(0)
+                    .filter(|token| token.kind() == "requires")
+                else {
                     return;
                 };
                 keyword.end_byte()..node.end_byte()
@@ -160,7 +164,7 @@ pub(super) fn views<'a>(
                     return;
                 };
                 let operands = arguments
-                    .named_children(&mut arguments.walk())
+                    .named_code_children(&mut arguments.walk())
                     .filter(|node| node.kind() != "comment")
                     .collect::<Vec<_>>();
                 if operands.len() != 1 {

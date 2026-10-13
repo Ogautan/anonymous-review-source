@@ -1,6 +1,7 @@
 //! Positive source proofs for accesses to freshly allocated C storage and
 //! source-proved automatic value storage. Ranges end at the first possible alias, publication, handoff or
 //! lifetime change; they do not claim that an object stays immutable afterward.
+use crate::cpp_detection::parser::CodeChildren;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -323,7 +324,7 @@ fn local_c_element_helpers(facts: &FileFacts<'_>) -> HashMap<String, Vec<bool>> 
             return;
         }
         let mut mask = Vec::new();
-        for parameter in parameters.named_children(&mut parameters.walk()) {
+        for parameter in parameters.named_code_children(&mut parameters.walk()) {
             let variable = parameter
                 .child_by_field_name("declarator")
                 .and_then(variable_name)
@@ -422,7 +423,7 @@ fn constant_c_array_bound(node: Node<'_>, source: &str, literals: &HashMap<Strin
             .get(node_text(node, source))
             .is_some_and(|end| *end <= node.start_byte()),
         "parenthesized_expression" => node
-            .named_child(0)
+            .named_code_child(0)
             .is_some_and(|n| constant_c_array_bound(n, source, literals)),
         "binary_expression" => {
             node.child_by_field_name("operator").is_some_and(|op| {
@@ -518,11 +519,11 @@ pub(super) fn discarded_memory_arguments(
                         &facts.file.source,
                     )
                     && let Some(arguments) = call.child_by_field_name("arguments")
-                    && arguments.named_child_count() == mask.len()
+                    && arguments.named_code_child_count() == mask.len()
                 {
                     for (index, safe) in mask.iter().enumerate() {
                         if *safe
-                            && let Some(argument) = arguments.named_child(index as u32)
+                            && let Some(argument) = arguments.named_code_child(index as u32)
                             && let Some(base) = memory_argument_base(facts, argument, &allocators)
                         {
                             uses.insert(base.start_byte());
@@ -550,11 +551,11 @@ pub(super) fn discarded_memory_arguments(
                 let Some(arguments) = call.child_by_field_name("arguments") else {
                     return;
                 };
-                if arguments.named_child_count() != 3 {
+                if arguments.named_code_child_count() != 3 {
                     return;
                 }
                 for index in 0..if name == "memset" { 1 } else { 2 } {
-                    if let Some(argument) = arguments.named_child(index)
+                    if let Some(argument) = arguments.named_code_child(index)
                         && let Some(base) = memory_argument_base(facts, argument, &allocators)
                     {
                         uses.insert(base.start_byte());
@@ -649,7 +650,7 @@ fn collect_element_effects(facts: &FileFacts<'_>) -> ElementEffectIndex {
         };
         let mut parameter_facts = Vec::new();
         let mut supported = true;
-        for parameter in parameters.named_children(&mut parameters.walk()) {
+        for parameter in parameters.named_code_children(&mut parameters.walk()) {
             if parameter.kind() != "parameter_declaration" {
                 supported = false;
                 break;
@@ -908,7 +909,7 @@ fn macro_parameter_effects(
     }
     let body_node = tree
         .root_node()
-        .named_child(0)?
+        .named_code_child(0)?
         .child_by_field_name("body")?;
     Some(
         parameters
@@ -1023,8 +1024,8 @@ fn element_identifier_use_safe(
             "subscript_expression" if parent.child_by_field_name("argument") == Some(current) => {
                 if addressed
                     || parent.child_by_field_name("indices").is_none_or(|indices| {
-                        indices.named_child_count() != 1
-                            || !indices.named_child(0).is_some_and(|index| {
+                        indices.named_code_child_count() != 1
+                            || !indices.named_code_child(0).is_some_and(|index| {
                                 super::evidence::primitive_local_operand(index, source)
                             })
                     })
@@ -1048,7 +1049,7 @@ fn element_identifier_use_safe(
                     return false;
                 };
                 let Some(argument_index) = arguments
-                    .named_children(&mut arguments.walk())
+                    .named_code_children(&mut arguments.walk())
                     .position(|argument| argument == current)
                 else {
                     return false;
@@ -1179,7 +1180,7 @@ fn element_call_consumes(facts: &FileFacts<'_>, arguments: Node<'_>, element: No
         return false;
     };
     let Some(argument_index) = arguments
-        .named_children(&mut arguments.walk())
+        .named_code_children(&mut arguments.walk())
         .position(|argument| argument == element)
     else {
         return false;
@@ -1272,7 +1273,7 @@ fn memory_argument_base<'tree>(
 ) -> Option<Node<'tree>> {
     let source = &facts.file.source;
     while value.kind() == "parenthesized_expression" {
-        value = value.named_child(0)?;
+        value = value.named_code_child(0)?;
     }
     if value.kind() == "pointer_expression"
         && value
@@ -1285,10 +1286,10 @@ fn memory_argument_base<'tree>(
         }
         while value.kind() == "subscript_expression" {
             let indices = value.child_by_field_name("indices")?;
-            if indices.named_child_count() != 1 {
+            if indices.named_code_child_count() != 1 {
                 return None;
             }
-            let index = indices.named_child(0)?;
+            let index = indices.named_code_child(0)?;
             if !super::evidence::primitive_local_operand(index, source) {
                 return None;
             }
@@ -1500,7 +1501,7 @@ fn variable_name(mut node: Node<'_>) -> Option<Node<'_>> {
             node.kind(),
             "parenthesized_declarator" | "reference_declarator"
         ) {
-            node = node.named_child(0)?;
+            node = node.named_code_child(0)?;
         } else {
             node = node.child_by_field_name("declarator")?;
         }
@@ -1589,7 +1590,7 @@ fn callable_scope(mut node: Node<'_>, source: &str) -> String {
 
 fn canonical_header_guard<'a>(node: Node<'_>, source: &'a str) -> Option<(&'a str, usize)> {
     if node.kind() != "preproc_ifdef"
-        || node.child(0)?.kind() != "#ifndef"
+        || node.code_child(0)?.kind() != "#ifndef"
         || node.child_by_field_name("alternative").is_some()
     {
         return None;
@@ -1597,7 +1598,7 @@ fn canonical_header_guard<'a>(node: Node<'_>, source: &'a str) -> Option<(&'a st
     let root = node
         .parent()
         .filter(|parent| parent.kind() == "translation_unit")?;
-    if root.named_children(&mut root.walk()).any(|sibling| {
+    if root.named_code_children(&mut root.walk()).any(|sibling| {
         sibling != node
             && sibling.kind() != "comment"
             && !(sibling.kind() == "preproc_call"
@@ -1607,7 +1608,7 @@ fn canonical_header_guard<'a>(node: Node<'_>, source: &'a str) -> Option<(&'a st
     }
     let name = node.child_by_field_name("name")?;
     let definition = node
-        .named_children(&mut node.walk())
+        .named_code_children(&mut node.walk())
         .find(|child| *child != name && child.kind() != "comment")?;
     if definition.kind() != "preproc_def"
         || node_text(definition.child_by_field_name("name")?, source) != node_text(name, source)
@@ -1658,7 +1659,7 @@ fn macro_include_edges(facts: &[FileFacts<'_>]) -> Vec<(usize, usize, usize)> {
         .enumerate()
         .filter_map(|(index, facts)| {
             let root = facts.file.tree.as_ref()?.root_node();
-            root.named_children(&mut root.walk()).find_map(|node| {
+            root.named_code_children(&mut root.walk()).find_map(|node| {
                 canonical_header_guard(node, &facts.file.source)
                     .map(|(name, offset)| (index, (name, offset)))
             })
@@ -1861,7 +1862,7 @@ fn allocator_summaries(
                 let mut parameter_shapes = Vec::new();
                 if let Some(parameters) = node.child_by_field_name("parameters") {
                     let mut cursor = parameters.walk();
-                    for parameter in parameters.named_children(&mut cursor) {
+                    for parameter in parameters.named_code_children(&mut cursor) {
                         let ty = parameter
                             .child_by_field_name("type")
                             .map(|ty| node_text(ty, &facts.file.source))
@@ -2061,21 +2062,21 @@ fn fresh_macro(
     }
     let Some(body) = tree
         .root_node()
-        .named_child(0)
+        .named_code_child(0)
         .and_then(|function| function.child_by_field_name("body"))
     else {
         return false;
     };
-    if body.named_child_count() != 1 {
+    if body.named_code_child_count() != 1 {
         return false;
     }
     let Some(statement) = body
-        .named_child(0)
+        .named_code_child(0)
         .filter(|statement| statement.kind() == "return_statement")
     else {
         return false;
     };
-    statement.named_child(0).is_some_and(|value| {
+    statement.named_code_child(0).is_some_and(|value| {
         fresh_expression(value, &source, allocators, &|name| {
             parameters.contains(name)
                 || !allocators.available(name, &facts[definition.file].file.path, definition.end)
@@ -2093,7 +2094,7 @@ fn unwrap_cast<'a>(mut node: Node<'a>, source: &str) -> Node<'a> {
     loop {
         match node.kind() {
             "parenthesized_expression" => {
-                if let Some(child) = node.named_child(0) {
+                if let Some(child) = node.named_code_child(0) {
                     node = child;
                 } else {
                     return node;
@@ -2116,7 +2117,7 @@ fn unwrap_cast<'a>(mut node: Node<'a>, source: &str) -> Node<'a> {
                 if cast
                     && let Some(argument) = node
                         .child_by_field_name("arguments")
-                        .and_then(|arguments| arguments.named_child(0))
+                        .and_then(|arguments| arguments.named_code_child(0))
                 {
                     node = argument;
                 } else {
@@ -2385,7 +2386,7 @@ fn literal_initializer(node: Node<'_>, source: &str) -> bool {
         "number_literal" | "char_literal" | "true" | "false" | "null" => true,
         "argument_list" | "initializer_list" | "parenthesized_expression" => {
             let mut cursor = node.walk();
-            node.named_children(&mut cursor)
+            node.named_code_children(&mut cursor)
                 .all(|child| literal_initializer(child, source))
         }
         "unary_expression" => {
@@ -2417,7 +2418,7 @@ fn automatic_record_is_safe(
     };
     let mut cursor = record.walk();
     if record
-        .named_children(&mut cursor)
+        .named_code_children(&mut cursor)
         .any(|child| child.kind() == "base_class_clause")
     {
         return false;
@@ -2426,7 +2427,7 @@ fn automatic_record_is_safe(
     let mut fields = HashSet::new();
     let mut constructors = Vec::new();
     let mut cursor = body.walk();
-    let members = body.named_children(&mut cursor).collect::<Vec<_>>();
+    let members = body.named_code_children(&mut cursor).collect::<Vec<_>>();
     for member in &members {
         if member.kind() == "field_declaration"
             && let Some(ty) = member.child_by_field_name("type")
@@ -2512,7 +2513,7 @@ fn automatic_record_is_safe(
         };
         let mut cursor = body.walk();
         if body
-            .named_children(&mut cursor)
+            .named_code_children(&mut cursor)
             .any(|child| child.kind() != "comment")
         {
             return false;
@@ -2523,20 +2524,20 @@ fn automatic_record_is_safe(
         else {
             return false;
         };
-        if parameters.named_child_count() != 0 {
+        if parameters.named_code_child_count() != 0 {
             return false;
         }
         let mut cursor = constructor.walk();
         for list in constructor
-            .named_children(&mut cursor)
+            .named_code_children(&mut cursor)
             .filter(|child| child.kind() == "field_initializer_list")
         {
             let mut cursor = list.walk();
-            for initializer in list.named_children(&mut cursor) {
-                let Some(field) = initializer.named_child(0) else {
+            for initializer in list.named_code_children(&mut cursor) {
+                let Some(field) = initializer.named_code_child(0) else {
                     return false;
                 };
-                let Some(value) = initializer.named_child(1) else {
+                let Some(value) = initializer.named_code_child(1) else {
                     return false;
                 };
                 if !fields.contains(node_text(field, source)) || !literal_initializer(value, source)
@@ -2579,7 +2580,7 @@ fn automatic_ranges(
                     .child_by_field_name("declarator")
                     .is_some_and(|node| node.kind() == "identifier")
                 && declarator.child_by_field_name("value").is_some_and(|node| {
-                    node.kind() == "initializer_list" && node.named_child_count() == 0
+                    node.kind() == "initializer_list" && node.named_code_child_count() == 0
                 }));
         if !plain {
             continue;
@@ -3095,10 +3096,10 @@ fn pointer_array_alias_assignment<'tree>(
         return None;
     }
     let arguments = alias.child_by_field_name("arguments")?;
-    if arguments.named_child_count() != 1 {
+    if arguments.named_code_child_count() != 1 {
         return None;
     }
-    let pointer = arguments.named_child(0)?;
+    let pointer = arguments.named_code_child(0)?;
     if pointer.kind() != "pointer_expression"
         || pointer
             .child_by_field_name("operator")
@@ -3111,8 +3112,11 @@ fn pointer_array_alias_assignment<'tree>(
         return None;
     }
     let indices = left.child_by_field_name("indices")?;
-    if indices.named_child_count() != 1
-        || !super::evidence::primitive_local_operand(indices.named_child(0)?, &facts.file.source)
+    if indices.named_code_child_count() != 1
+        || !super::evidence::primitive_local_operand(
+            indices.named_code_child(0)?,
+            &facts.file.source,
+        )
     {
         return None;
     }
@@ -3157,7 +3161,7 @@ fn primitive_pointer_array_type(ty: Node<'_>, source: &str) -> bool {
         _ => return false,
     };
     declarator
-        .named_child(0)
+        .named_code_child(0)
         .is_some_and(|node| node.kind() == "abstract_pointer_declarator")
 }
 
@@ -3296,7 +3300,7 @@ fn plain_record_alias_shape(
             };
             let mut fields = Vec::new();
             let mut valid = true;
-            for field in body.named_children(&mut body.walk()) {
+            for field in body.named_code_children(&mut body.walk()) {
                 if field.kind() != "field_declaration"
                     || !field.child_by_field_name("type").is_some_and(|field_type| {
                         matches!(field_type.kind(), "primitive_type" | "sized_type_specifier")
@@ -3450,9 +3454,9 @@ fn bounded_alias_scalar_use(
         let Some(indices) = parent.child_by_field_name("indices") else {
             return false;
         };
-        if indices.named_child_count() != 1
+        if indices.named_code_child_count() != 1
             || !indices
-                .named_child(0)
+                .named_code_child(0)
                 .is_some_and(|index| bounded_index_operand(facts, index))
         {
             return false;
@@ -3590,9 +3594,12 @@ fn private_pointer_table_uses(
             {
                 return None;
             }
-            let index = node_text(slot.child_by_field_name("indices")?.named_child(0)?, source)
-                .parse::<usize>()
-                .ok()?;
+            let index = node_text(
+                slot.child_by_field_name("indices")?.named_code_child(0)?,
+                source,
+            )
+            .parse::<usize>()
+            .ok()?;
             if index >= size || !initialized.insert(index) {
                 return None;
             }
@@ -3613,8 +3620,11 @@ fn private_pointer_table_uses(
             }
             for subscript in [slot, parent] {
                 let indices = subscript.child_by_field_name("indices")?;
-                if indices.named_child_count() != 1
-                    || !super::evidence::primitive_local_operand(indices.named_child(0)?, source)
+                if indices.named_code_child_count() != 1
+                    || !super::evidence::primitive_local_operand(
+                        indices.named_code_child(0)?,
+                        source,
+                    )
                 {
                     return None;
                 }
@@ -3793,7 +3803,7 @@ fn strip_pointer_casts<'tree>(mut value: Node<'tree>, source: &str) -> Node<'tre
                 })
             && let Some(argument) = value
                 .child_by_field_name("arguments")
-                .and_then(|arguments| arguments.named_child(0))
+                .and_then(|arguments| arguments.named_code_child(0))
         {
             value = argument;
             continue;
@@ -3808,7 +3818,7 @@ fn strip_parenthesized<'tree>(mut value: Node<'tree>) -> Node<'tree> {
         if value.kind() != "parenthesized_expression" {
             break;
         }
-        let Some(inner) = value.named_child(0) else {
+        let Some(inner) = value.named_code_child(0) else {
             break;
         };
         value = inner;
@@ -3855,10 +3865,10 @@ fn integer_pointer_root<'tree>(mut value: Node<'tree>, source: &str) -> Option<N
             })
     {
         let arguments = value.child_by_field_name("arguments")?;
-        if arguments.named_child_count() != 1 {
+        if arguments.named_code_child_count() != 1 {
             return None;
         }
-        return identifier_value(arguments.named_child(0)?);
+        return identifier_value(arguments.named_code_child(0)?);
     }
     None
 }
@@ -3900,10 +3910,10 @@ fn integer_constant(value: Node<'_>, source: &str) -> Option<u128> {
                 return None;
             }
             let arguments = value.child_by_field_name("arguments")?;
-            if arguments.named_child_count() != 1 {
+            if arguments.named_code_child_count() != 1 {
                 return None;
             }
-            let constant = integer_constant(arguments.named_child(0)?, source)?;
+            let constant = integer_constant(arguments.named_code_child(0)?, source)?;
             integer_cast_fits(target, constant).then_some(constant)
         }
         "unary_expression" => {
@@ -4028,16 +4038,16 @@ fn allocation_capacity_lower_bound(
     let arguments = call.child_by_field_name("arguments")?;
     let mut active = HashSet::new();
     match name {
-        "malloc" if arguments.named_child_count() == 1 => {
-            integer_lower_bound(arguments.named_child(0)?, facts, &mut active)
+        "malloc" if arguments.named_code_child_count() == 1 => {
+            integer_lower_bound(arguments.named_code_child(0)?, facts, &mut active)
         }
-        "calloc" if arguments.named_child_count() == 2 => {
-            let count = integer_lower_bound(arguments.named_child(0)?, facts, &mut active)?;
-            let size = integer_lower_bound(arguments.named_child(1)?, facts, &mut active)?;
+        "calloc" if arguments.named_code_child_count() == 2 => {
+            let count = integer_lower_bound(arguments.named_code_child(0)?, facts, &mut active)?;
+            let size = integer_lower_bound(arguments.named_code_child(1)?, facts, &mut active)?;
             count.checked_mul(size).and_then(allocation_integer_bound)
         }
-        "aligned_alloc" if arguments.named_child_count() == 2 => {
-            integer_lower_bound(arguments.named_child(1)?, facts, &mut active)
+        "aligned_alloc" if arguments.named_code_child_count() == 2 => {
+            integer_lower_bound(arguments.named_code_child(1)?, facts, &mut active)
         }
         _ => None,
     }
@@ -4126,7 +4136,7 @@ fn integer_lower_bound(
             }
             let arguments = value.child_by_field_name("arguments")?;
             let mut lower = None;
-            for argument in arguments.named_children(&mut arguments.walk()) {
+            for argument in arguments.named_code_children(&mut arguments.walk()) {
                 if let Some(candidate) = integer_lower_bound(argument, facts, active) {
                     lower = Some(lower.map_or(candidate, |current: u128| current.max(candidate)));
                 }
@@ -4228,7 +4238,7 @@ fn allocation_alias_base<'tree>(mut value: Node<'tree>, source: &str) -> Option<
     for _ in 0..16 {
         match value.kind() {
             "identifier" => return Some(value),
-            "parenthesized_expression" => value = value.named_child(0)?,
+            "parenthesized_expression" => value = value.named_code_child(0)?,
             "cast_expression" => {
                 let ty = value.child_by_field_name("type")?;
                 if !primitive_single_pointer_type(ty) {
@@ -4267,7 +4277,7 @@ fn primitive_single_pointer_type(ty: Node<'_>) -> bool {
         return false;
     };
     while shape.kind() == "abstract_parenthesized_declarator" {
-        let Some(inner) = shape.named_child(0) else {
+        let Some(inner) = shape.named_code_child(0) else {
             return false;
         };
         shape = inner;
@@ -4468,8 +4478,8 @@ fn address_used_only_by_memset(
             continue;
         }
         if parent.kind() != "argument_list"
-            || parent.named_child(0) != Some(address)
-            || parent.named_child_count() != 3
+            || parent.named_code_child(0) != Some(address)
+            || parent.named_code_child_count() != 3
         {
             return false;
         }
@@ -4508,7 +4518,7 @@ fn fresh_returning_function(
         if node.kind() != "return_statement" || enclosing_function(node) != Some(function) {
             return;
         }
-        let Some(value) = node.named_child(0) else {
+        let Some(value) = node.named_code_child(0) else {
             valid = false;
             return;
         };

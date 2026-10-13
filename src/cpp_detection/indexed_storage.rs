@@ -1,6 +1,7 @@
 //! A write below an indirect element does not write the outer contiguous slot.
 //! Bind each use lexically; unknown types, overloaded operators and ambiguous
 //! uses must not supply a negative proof for another access on the same line.
+use crate::cpp_detection::parser::CodeChildren;
 use std::collections::{HashMap, HashSet};
 
 use super::super::parser::{ParsedCppFile, node_text, walk_nodes};
@@ -145,7 +146,7 @@ fn declared_shape(mut node: Node<'_>, mut shape: Shape) -> Shape {
         };
         let Some(inner) = node
             .child_by_field_name("declarator")
-            .or_else(|| node.named_child(0))
+            .or_else(|| node.named_code_child(0))
         else {
             return Shape::Unknown;
         };

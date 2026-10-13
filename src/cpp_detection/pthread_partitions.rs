@@ -1,5 +1,6 @@
 //! Seed runtime identity from a concrete pthread launch, not variable spelling.
 use super::*;
+use crate::cpp_detection::parser::CodeChildren;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Seed {
@@ -117,7 +118,9 @@ pub(super) fn seed(file: &ParsedCppFile, origins: &mut IndexPartitionOrigins) {
         let Some(args) = call.child_by_field_name("arguments") else {
             return;
         };
-        let args = args.named_children(&mut args.walk()).collect::<Vec<_>>();
+        let args = args
+            .named_code_children(&mut args.walk())
+            .collect::<Vec<_>>();
         if args.len() != 4 {
             return;
         }

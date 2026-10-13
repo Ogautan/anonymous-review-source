@@ -1,3 +1,4 @@
+use crate::cpp_detection::parser::CodeChildren;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -122,17 +123,23 @@ fn analyze_record(
     };
     let (qualified_name, externally_reachable) = record_identity(node, &name, file);
     let text = node_text(node, &file.source);
-    let align_bytes = extract_align_bytes(declaration_text);
+    // Record attributes are outside the member body. An aligned local or
+    // static member in that body cannot supply the instance's alignment.
+    let record_header = node_text(node, &file.source)
+        .split('{')
+        .next()
+        .unwrap_or("");
+    let align_bytes = extract_align_bytes(record_header);
     let is_cache_aligned = align_bytes
         .map(|bytes| bytes >= cache_line_size)
         .unwrap_or(false)
-        || has_explicit_cache_alignment(declaration_text, cache_line_size);
+        || has_explicit_cache_alignment(record_header, cache_line_size);
     let is_packed = text.contains("__attribute__((packed")
         || text.contains("[[gnu::packed]]")
         || surrounding_has_pack(&file.source, node.start_byte());
     let has_no_unique_address = text.contains("[[no_unique_address]]");
     let has_base_classes = node
-        .children(&mut node.walk())
+        .code_children(&mut node.walk())
         .any(|child| child.kind() == "base_class_clause");
 
     let body = node.child_by_field_name("body")?;
@@ -140,7 +147,7 @@ fn analyze_record(
     let mut public_methods = Vec::new();
     let mut current_visibility = default_visibility;
     let mut cursor = body.walk();
-    for child in body.children(&mut cursor) {
+    for child in body.code_children(&mut cursor) {
         match child.kind() {
             "access_specifier" => {
                 current_visibility = parse_access_specifier(node_text(child, &file.source));
@@ -213,6 +220,9 @@ fn analyze_record(
         .cloned()
         .collect::<Vec<_>>();
     fields.retain(|field| !field.is_static);
+    let align_bytes = align_bytes.max(fields.iter().filter_map(|field| field.align_bytes).max());
+    let is_cache_aligned =
+        is_cache_aligned || align_bytes.is_some_and(|alignment| alignment >= cache_line_size);
     let ordered_own_fields = ordered_own_field_declarations(body, &file.source, &fields);
     let public_fields = fields
         .iter()
@@ -288,7 +298,7 @@ fn ordered_own_field_declarations(body: Node<'_>, source: &str, fields: &[CppFie
         return false;
     }
     let mut declared = Vec::new();
-    for member in body.named_children(&mut body.walk()) {
+    for member in body.named_code_children(&mut body.walk()) {
         match member.kind() {
             "comment"
             | "access_specifier"
@@ -407,7 +417,7 @@ fn parse_field_declaration(
                     let name = node_text(name, &file.source);
                     name == "guarded_by" || name.ends_with("GUARDED_BY")
                 }) {
-            node.children(&mut node.walk())
+            node.code_children(&mut node.walk())
                 .filter(|child| {
                     child.kind() == "ERROR" && child.end_byte() <= declarator.start_byte()
                 })
@@ -453,15 +463,97 @@ fn parse_field_declaration(
             array_len,
             element_type,
             cache_line_size,
+            field_declaration_alignment(node, declarator, &file.source),
+            field_declaration_qualifiers(node, &file.source),
         ));
     }
 
     fields
 }
 
+#[derive(Clone, Copy, Default)]
+struct FieldQualifiers {
+    is_static: bool,
+    is_read_only: bool,
+}
+
+fn field_declaration_qualifiers(declaration: Node<'_>, source: &str) -> FieldQualifiers {
+    let mut qualifiers = FieldQualifiers::default();
+    for child in declaration.named_code_children(&mut declaration.walk()) {
+        if matches!(child.kind(), "storage_class_specifier" | "type_qualifier") {
+            match node_text(child, source).trim() {
+                "static" => qualifiers.is_static = true,
+                "const" | "constexpr" | "consteval" => qualifiers.is_read_only = true,
+                _ => {}
+            }
+        }
+    }
+    qualifiers
+}
+
+fn field_declaration_alignment(
+    declaration: Node<'_>,
+    declarator: Node<'_>,
+    source: &str,
+) -> Option<usize> {
+    let declarators: Vec<_> = declaration
+        .children_by_field_name("declarator", &mut declaration.walk())
+        .collect();
+    let mut alignment = None;
+    for child in declaration.named_code_children(&mut declaration.walk()) {
+        if !matches!(
+            child.kind(),
+            "type_qualifier"
+                | "attribute_specifier"
+                | "attribute_declaration"
+                | "ms_declspec_modifier"
+        ) {
+            continue;
+        }
+        // Prefix attributes apply to the declaration. A trailing GNU attribute
+        // belongs to the preceding declarator, not to every sibling field.
+        let preceding = declarators
+            .iter()
+            .filter(|decl| decl.start_byte() < child.start_byte())
+            .max_by_key(|decl| decl.start_byte());
+        if preceding.is_none_or(|decl| *decl == declarator) {
+            alignment = alignment.max(extract_align_bytes(node_text(child, source)));
+        }
+    }
+    // Some declarator forms retain their own attributes. Never descend into
+    // an initializer, lambda body, array expression, or parameter declaration.
+    let mut pending = vec![declarator];
+    while let Some(node) = pending.pop() {
+        if matches!(
+            node.kind(),
+            "attribute_specifier" | "attribute_declaration" | "ms_declspec_modifier"
+        ) {
+            alignment = alignment.max(extract_align_bytes(node_text(node, source)));
+        } else if matches!(
+            node.kind(),
+            "identifier"
+                | "field_identifier"
+                | "pointer_declarator"
+                | "reference_declarator"
+                | "array_declarator"
+                | "parenthesized_declarator"
+                | "attributed_declarator"
+        ) {
+            pending.extend(node.named_code_children(&mut node.walk()).filter(|child| {
+                Some(*child) == node.child_by_field_name("declarator")
+                    || matches!(
+                        child.kind(),
+                        "attribute_specifier" | "attribute_declaration" | "ms_declspec_modifier"
+                    )
+            }));
+        }
+    }
+    alignment
+}
+
 fn mark_bitfield_groups(body: Node<'_>, source: &str, fields: &mut [CppFieldInfo]) {
     let mut group = 0usize;
-    for declaration in body.named_children(&mut body.walk()) {
+    for declaration in body.named_code_children(&mut body.walk()) {
         if declaration.kind() == "comment" {
             continue;
         }
@@ -488,7 +580,7 @@ fn mark_bitfield_groups(body: Node<'_>, source: &str, fields: &mut [CppFieldInfo
         }
         let mut name = None;
         let mut bitfield = false;
-        for child in declaration.named_children(&mut declaration.walk()) {
+        for child in declaration.named_code_children(&mut declaration.walk()) {
             if child.kind() == "field_identifier" {
                 if name.is_some() {
                     group += 1;
@@ -530,7 +622,7 @@ fn nonzero_bitfield_branches(node: Node<'_>, source: &str) -> bool {
     if node.kind() == "field_declaration" {
         let mut pending = false;
         let mut widths = 0;
-        for child in node.named_children(&mut node.walk()) {
+        for child in node.named_code_children(&mut node.walk()) {
             match child.kind() {
                 "field_identifier" => {
                     if pending {
@@ -561,7 +653,7 @@ fn nonzero_bitfield_branches(node: Node<'_>, source: &str) -> bool {
     ) {
         return false;
     }
-    node.named_children(&mut node.walk()).all(|child| {
+    node.named_code_children(&mut node.walk()).all(|child| {
         Some(child) == node.child_by_field_name("condition")
             || Some(child) == node.child_by_field_name("name")
             || nonzero_bitfield_branches(child, source)
@@ -640,6 +732,18 @@ fn parse_field_declaration_fallback(
             array_len,
             is_array.then(|| ty.to_string()),
             cache_line_size,
+            extract_align_bytes(field_text.split(['=', '{']).next().unwrap_or("")),
+            {
+                // Initializer text cannot change a member's storage duration.
+                let prefix = field_text.split(['=', '{', '[']).next().unwrap_or("");
+                let tokens = super::parser::source_text::code_tokens(prefix);
+                FieldQualifiers {
+                    is_static: tokens.contains(&"static"),
+                    is_read_only: tokens
+                        .iter()
+                        .any(|token| matches!(*token, "const" | "constexpr" | "consteval")),
+                }
+            },
         ));
     }
 
@@ -657,24 +761,23 @@ fn make_field(
     array_len: Option<usize>,
     element_type: Option<String>,
     cache_line_size: usize,
+    align_bytes: Option<usize>,
+    qualifiers: FieldQualifiers,
 ) -> CppFieldInfo {
-    let is_static = declaration_text
-        .split([';', '='])
-        .next()
-        .is_some_and(|prefix| identifier_words(prefix).any(|token| token == "static"));
-    let is_read_only = identifier_words(declaration_text)
-        .any(|token| matches!(token, "const" | "constexpr" | "consteval"));
+    let FieldQualifiers {
+        is_static,
+        is_read_only,
+    } = qualifiers;
     let is_atomic = !is_read_only && is_cpp_atomic_type(&ty_str);
     let is_hot_scalar = !is_read_only && is_hot_scalar_field(&name, &ty_str);
     let is_hot_sync = !is_read_only && is_cpp_hot_sync_type(&ty_str);
     let is_indirect = is_indirection_type(&ty_str);
-    // Declaration text contains a member name and initializer, not just a
-    // type. Use it for explicit alignment, but do not let either supply the
-    // nominal type's size (or invalidate a known scalar's exact spelling).
-    let estimated_size = extract_align_bytes(declaration_text)
-        .or_else(|| estimate_cpp_type_size(&ty_str, is_array, array_len, cache_line_size));
-    let is_cache_padded = field_has_align(declaration_text, cache_line_size)
-        || has_explicit_cache_alignment(declaration_text, cache_line_size);
+    // Member names and initializers cannot supply size, alignment, or storage
+    // qualifiers. Keep nominal type size separate from recovered attributes.
+    let estimated_size = estimate_cpp_type_size(&ty_str, is_array, array_len, cache_line_size);
+    // Aligning a member's start does not isolate it from following members.
+    // Only a padded inline type may supply this guarantee during enrichment.
+    let is_cache_padded = false;
     let is_manual_padding = is_manual_padding_field(&name, &ty_str)
         && (estimated_size.is_some_and(|size| size >= cache_line_size)
             || bracketed_expression_mentions_cache_line(declaration_text, cache_line_size));
@@ -685,6 +788,7 @@ fn make_field(
         ty_str,
         line,
         estimated_size,
+        align_bytes,
         offset: None,
         is_atomic,
         is_hot_scalar,
@@ -886,7 +990,8 @@ fn collect_records_fallback(
             .filter(|field| field.is_hot_sync && !field.is_cache_padded)
             .map(|field| field.name.clone())
             .collect();
-        let align_bytes = extract_align_bytes(text);
+        let align_bytes = extract_align_bytes(header.as_str())
+            .max(fields.iter().filter_map(|field| field.align_bytes).max());
         let total_estimated_size = total_size(&fields, cache_line_size, align_bytes);
         let cache_line_groups = compute_cache_line_groups(&fields, cache_line_size);
 
@@ -901,7 +1006,7 @@ fn collect_records_fallback(
             fields: fields.clone(),
             static_fields,
             align_bytes,
-            is_cache_aligned: has_explicit_cache_alignment(text, cache_line_size),
+            is_cache_aligned: align_bytes.is_some_and(|alignment| alignment >= cache_line_size),
             is_packed: text.contains("packed") || surrounding_has_pack(&file.source, name_offset),
             has_cache_padding: fields
                 .iter()
@@ -1263,7 +1368,7 @@ fn record_scoped_aliases(files: &[ParsedCppFile]) -> RecordAliases {
             let mut visible = HashMap::new();
             for scope in scopes {
                 let mut cursor = scope.walk();
-                for alias in scope.named_children(&mut cursor) {
+                for alias in scope.named_code_children(&mut cursor) {
                     if !matches!(alias.kind(), "alias_declaration" | "type_definition")
                         || alias.has_error()
                         || (scope.kind() != "field_declaration_list"
@@ -1410,11 +1515,13 @@ fn enrich_with_local_types(
                 let Some(local_type) = summary_name(&resolved) else {
                     continue;
                 };
-                if let Some((inner_hot, inner_size, inner_aligned, _)) = summaries.get(&local_type)
+                if let Some((inner_hot, inner_size, inner_aligned, inner_alignment)) =
+                    summaries.get(&local_type)
                 {
                     contains_hot |= *inner_hot && !inner_aligned;
                     field.estimated_size = field.estimated_size.or(*inner_size);
                     field.is_cache_padded |= *inner_aligned;
+                    field.align_bytes = field.align_bytes.max(*inner_alignment);
                 }
             }
             let next = (
@@ -1454,6 +1561,7 @@ fn enrich_with_local_types(
             if let Some((contains_hot, size, aligned, alignment)) =
                 summaries.get(&local_type).copied()
             {
+                field.align_bytes = field.align_bytes.max(alignment);
                 if aligned {
                     field.is_cache_padded = true;
                 } else {
@@ -1480,6 +1588,7 @@ pub(crate) fn ablate_protection_evidence(record: &mut CppStructInfo, cache_line_
     record.is_cache_aligned = false;
     record.has_cache_padding = false;
     for field in &mut record.fields {
+        field.align_bytes = None;
         if field.is_cache_padded || field.is_manual_padding {
             // Removing a field alignment does not erase the underlying
             // scalar type's size. Wrapper/padding-only sizes remain unknown.
@@ -1501,6 +1610,16 @@ pub(crate) fn ablate_protection_evidence(record: &mut CppStructInfo, cache_line_
 }
 
 fn recompute(record: &mut CppStructInfo, cache_line_size: usize) {
+    record.align_bytes = record.align_bytes.max(
+        record
+            .fields
+            .iter()
+            .filter_map(|field| field.align_bytes)
+            .max(),
+    );
+    record.is_cache_aligned = record
+        .align_bytes
+        .is_some_and(|alignment| alignment >= cache_line_size);
     record.has_cache_padding = record.has_cache_padding
         || record
             .fields
@@ -1548,11 +1667,7 @@ fn compute_estimated_offsets(
 
     for field in fields {
         let size = field.estimated_size.unwrap_or(8).max(1);
-        let align = if field.is_cache_padded {
-            cache_line_size
-        } else {
-            estimate_cpp_type_alignment(&field.ty_str, size)
-        };
+        let align = field_alignment(field, cache_line_size);
         let offset = align_up(current_offset, align);
         offsets.push(Some(offset));
         current_offset = offset + size;
@@ -1634,7 +1749,7 @@ pub fn fields_may_share_cache_line(record: &CppStructInfo, fields: &[String]) ->
                     .filter_map(|field| {
                         field
                             .estimated_size
-                            .map(|size| estimate_cpp_type_alignment(&field.ty_str, size))
+                            .map(|_| field_alignment(field, record.cache_line_size))
                     })
                     .max()
                     .unwrap_or(1)
@@ -1716,9 +1831,8 @@ pub(crate) fn fields_may_share_across_objects(
                 .iter()
                 .filter_map(|f| {
                     let outer = outer_type_spelling(&f.ty_str);
-                    (scalar_type_size(&f.ty_str).is_some() || outer.contains(['*', '&'])).then(
-                        || estimate_cpp_type_alignment(&f.ty_str, f.estimated_size.unwrap_or(1)),
-                    )
+                    (scalar_type_size(&f.ty_str).is_some() || outer.contains(['*', '&']))
+                        .then(|| field_alignment(f, record.cache_line_size))
                 })
                 .max()
                 .unwrap_or(1)
@@ -1821,13 +1935,7 @@ fn total_size(
         })?;
     let natural_alignment = fields
         .iter()
-        .map(|field| {
-            if field.is_cache_padded {
-                cache_line_size
-            } else {
-                estimate_cpp_type_alignment(&field.ty_str, field.estimated_size.unwrap_or(1))
-            }
-        })
+        .map(|field| field_alignment(field, cache_line_size))
         .max()
         .unwrap_or(1)
         .max(explicit_alignment.unwrap_or(1));
@@ -1863,6 +1971,16 @@ fn estimate_cpp_type_alignment(ty: &str, size: usize) -> usize {
                 .min(8)
         }
     })
+}
+
+fn field_alignment(field: &CppFieldInfo, cache_line_size: usize) -> usize {
+    estimate_cpp_type_alignment(&field.ty_str, field.estimated_size.unwrap_or(1))
+        .max(field.align_bytes.unwrap_or(1))
+        .max(if field.is_cache_padded {
+            cache_line_size
+        } else {
+            1
+        })
 }
 
 fn estimate_cpp_type_size(
@@ -2038,30 +2156,107 @@ fn bracketed_usize(text: &str) -> Option<usize> {
     text[open + 1..close].trim().parse().ok()
 }
 
-fn field_has_align(ty: &str, cache_line_size: usize) -> bool {
-    extract_align_bytes(ty)
-        .map(|bytes| bytes >= cache_line_size)
-        .unwrap_or(false)
-}
-
 pub(crate) fn extract_align_bytes(text: &str) -> Option<usize> {
-    extract_parenthesized_usize(text, "alignas")
-        .or_else(|| extract_parenthesized_usize(text, "aligned"))
+    let tokens = super::parser::source_text::code_tokens(text);
+    let mut alignment = None;
+    for (index, token) in tokens.iter().enumerate() {
+        if *token == "alignas" {
+            alignment = alignment.max(numeric_attribute_argument(&tokens, index));
+        } else if matches!(*token, "__attribute__" | "__attribute")
+            && tokens.get(index + 1) == Some(&"(")
+            && tokens.get(index + 2) == Some(&"(")
+            && let Some(end) = closing_parenthesis(&tokens, index + 2)
+            && tokens.get(end + 1) == Some(&")")
+        {
+            let mut depth = 0usize;
+            for attribute in index + 3..end {
+                if depth == 0
+                    && (attribute == index + 3 || tokens[attribute - 1] == ",")
+                    && matches!(tokens[attribute], "aligned" | "__aligned__")
+                {
+                    alignment = alignment.max(numeric_attribute_argument(&tokens, attribute));
+                }
+                match tokens[attribute] {
+                    "(" => depth += 1,
+                    ")" => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+        } else if *token == "[" && tokens.get(index + 1) == Some(&"[") {
+            let Some(end) = (index + 2..tokens.len().saturating_sub(1))
+                .find(|&end| tokens[end..end + 2] == ["]", "]"])
+            else {
+                continue;
+            };
+            let using_gnu = tokens.get(index + 2..index + 5) == Some(&["using", "gnu", ":"]);
+            let begin = index + if using_gnu { 5 } else { 2 };
+            let mut depth = 0usize;
+            for attribute in begin..end {
+                if depth == 0 && (attribute == begin || tokens[attribute - 1] == ",") {
+                    if using_gnu && tokens[attribute] == "aligned" {
+                        alignment = alignment.max(numeric_attribute_argument(&tokens, attribute));
+                    } else if tokens.get(attribute..attribute + 4)
+                        == Some(&["gnu", ":", ":", "aligned"])
+                    {
+                        alignment =
+                            alignment.max(numeric_attribute_argument(&tokens, attribute + 3));
+                    }
+                }
+                match tokens[attribute] {
+                    "(" => depth += 1,
+                    ")" => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+        } else if *token == "__declspec"
+            && tokens.get(index + 1..index + 3) == Some(&["(", "align"])
+            && tokens.get(index + 6) == Some(&")")
+        {
+            alignment = alignment.max(numeric_attribute_argument(&tokens, index + 2));
+        }
+    }
+    alignment
 }
 
-fn extract_parenthesized_usize(text: &str, marker: &str) -> Option<usize> {
-    let mut remainder = text;
-    while let Some(marker_offset) = remainder.find(marker) {
-        let after_marker = &remainder[marker_offset + marker.len()..];
-        let open = after_marker.find('(')?;
-        let after_open = &after_marker[open + 1..];
-        let close = after_open.find(')')?;
-        if let Ok(value) = after_open[..close].trim().parse() {
-            return Some(value);
+fn closing_parenthesis(tokens: &[&str], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        match *token {
+            "(" => depth += 1,
+            ")" => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
         }
-        remainder = &after_open[close + 1..];
     }
     None
+}
+
+fn numeric_attribute_argument(tokens: &[&str], name: usize) -> Option<usize> {
+    if tokens.get(name + 1) != Some(&"(") || tokens.get(name + 3) != Some(&")") {
+        return None;
+    }
+    let literal = tokens.get(name + 2)?.replace('\'', "");
+    let literal = literal.trim_end_matches(['u', 'U', 'l', 'L']);
+    let value = if let Some(hex) = literal
+        .strip_prefix("0x")
+        .or_else(|| literal.strip_prefix("0X"))
+    {
+        usize::from_str_radix(hex, 16).ok()
+    } else if let Some(binary) = literal
+        .strip_prefix("0b")
+        .or_else(|| literal.strip_prefix("0B"))
+    {
+        usize::from_str_radix(binary, 2).ok()
+    } else if literal.starts_with('0') && literal.len() > 1 {
+        usize::from_str_radix(literal, 8).ok()
+    } else {
+        literal.parse().ok()
+    }?;
+    value.is_power_of_two().then_some(value)
 }
 
 fn has_explicit_cache_alignment(text: &str, cache_line_size: usize) -> bool {
@@ -2125,7 +2320,7 @@ fn extract_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
         | "attributed_declarator"
         | "init_declarator" => {
             let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
+            for child in node.code_children(&mut cursor) {
                 if let Some(name) = extract_declarator_name(child, source) {
                     return Some(name);
                 }
@@ -2252,7 +2447,7 @@ fn field_declaration_is_method(node: Node<'_>, source: &str) -> bool {
                             if inner.kind() != "parenthesized_declarator" {
                                 return false;
                             }
-                            let Some(indirection) = inner.named_child(0) else {
+                            let Some(indirection) = inner.named_code_child(0) else {
                                 return false;
                             };
                             if !matches!(
@@ -2263,7 +2458,7 @@ fn field_declaration_is_method(node: Node<'_>, source: &str) -> bool {
                             }
                             indirection
                                 .child_by_field_name("declarator")
-                                .or_else(|| indirection.named_child(0))
+                                .or_else(|| indirection.named_code_child(0))
                                 .is_some_and(|name| {
                                     matches!(name.kind(), "identifier" | "field_identifier")
                                 })
@@ -2274,7 +2469,7 @@ fn field_declaration_is_method(node: Node<'_>, source: &str) -> bool {
                 // that spine, never parameters or default-value expressions.
                 let inner = declarator.child_by_field_name("declarator").or_else(|| {
                     (declarator.kind() == "reference_declarator")
-                        .then(|| declarator.named_child(0))
+                        .then(|| declarator.named_code_child(0))
                         .flatten()
                 });
                 let Some(inner) = inner else {
@@ -2308,6 +2503,36 @@ fn align_up(value: usize, align: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alignment_requires_real_attribute_syntax_and_uses_the_strongest_constraint() {
+        for (source, expected) in [
+            ("alignas(32) alignas(128) int value", Some(128)),
+            ("int value __attribute__((aligned(64)))", Some(64)),
+            (
+                "int value __attribute__((unused, __aligned__(0x40UL)))",
+                Some(64),
+            ),
+            ("[[gnu::aligned(128)]] int value", Some(128)),
+            ("[[using gnu: aligned(64)]] int value", Some(64)),
+            ("__declspec(align(64)) int value", Some(64)),
+            ("int value = aligned(128)", None),
+            ("int aligned_counter{64}", None),
+            ("/* alignas(64) */ int value", None),
+            ("const char* value = \"alignas(128)\"", None),
+            (
+                "const char* value = R\"tag(__attribute__((aligned(128))))tag\"",
+                None,
+            ),
+            ("[[custom::aligned(128)]] int value", None),
+            ("[[custom::gnu::aligned(128)]] int value", None),
+            ("__attribute__((deprecated(aligned(128)))) int value", None),
+            ("alignas(0) int value", None),
+            ("alignas(48) int value", None),
+        ] {
+            assert_eq!(extract_align_bytes(source), expected, "{source}");
+        }
+    }
 
     #[test]
     fn recovered_record_inheritance_is_read_only_from_the_header() {

@@ -34,6 +34,23 @@ require the target project to compile. Source-estimated Rust layouts are
 not ABI guarantees. The optional `--rustc-layout` mode requires nightly Rust
 and a target that Cargo can build.
 
+Rust container findings require accesses to potentially distinct elements
+with at least one element write. Single-element arrays and accesses confined
+to one recovered constant index do not supply an element pair. In C++, member
+alignment constrains the start address without padding the member's type;
+aligning one scalar does not isolate it from the following scalar.
+
+C++ syntax trees use the original active source. Evidence and text fallback
+use a comment-masked view with the same byte offsets and line numbers. Semantic
+AST traversal skips comment nodes; quoted literals and include header names are
+preserved. Alignment must come from attribute syntax associated with the declaration. Rust pattern
+bindings respect scope; mutable index effects invalidate constant facts, and
+unresolved integer widths cannot supply an overflowing constant exclusion.
+Native Rust sequence accessors retain integer index constraints through
+`get`/`get_unchecked` and their element-reference `unwrap`/`expect` projections.
+Continuous-element findings from different container fields keep separate
+storage-pair groups in both frontends.
+
 ## Source layout
 
 - `src/`: shared pattern model, Rust frontend, C++ frontend, and CLI.

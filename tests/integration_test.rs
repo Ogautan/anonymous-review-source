@@ -938,8 +938,8 @@ pub struct DashMap<K, V> {
 }
 
 impl<K, V> DashMap<K, V> {
-    pub fn get(&self, _key: &K) -> Option<&V> {
-        let _guard = self.shards[0].read().unwrap();
+    pub fn get(&self, index: usize, _key: &K) -> Option<&V> {
+        let _guard = self.shards[index].read().unwrap();
         None
     }
 }
@@ -2279,8 +2279,8 @@ pub fn update_b(outer: Arc<Outer>) {
     outer.inner.b.fetch_add(1, Ordering::Relaxed);
 }
 
-pub fn update_counter(outer: Arc<Outer>) {
-    outer.counters[0].fetch_add(1, Ordering::Relaxed);
+pub fn update_counter(outer: Arc<Outer>, index: usize) {
+    outer.counters[index].fetch_add(1, Ordering::Relaxed);
 }
 "#,
         )],

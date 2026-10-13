@@ -1,3 +1,4 @@
+use crate::cpp_detection::parser::CodeChildren;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -2056,7 +2057,7 @@ fn terminal_thread_entry_store(
                         "thrd_create" | "g_thread_new" => Some(1),
                         _ => None,
                     })
-                    .is_some_and(|position| parent.named_child(position) == Some(argument));
+                    .is_some_and(|position| parent.named_code_child(position) == Some(argument));
             // Aliases, address-taking outside a thread creation call and
             // ordinary calls may invoke this body repeatedly on a hot path.
             unsupported |= !thread_callback;
@@ -2065,7 +2066,9 @@ fn terminal_thread_entry_store(
     if unsupported {
         return false;
     }
-    let siblings = block.named_children(&mut block.walk()).collect::<Vec<_>>();
+    let siblings = block
+        .named_code_children(&mut block.walk())
+        .collect::<Vec<_>>();
     let Some(position) = siblings.iter().position(|n| *n == statement) else {
         return false;
     };
@@ -2099,7 +2102,9 @@ fn terminal_thread_entry_store(
     let Some(loop_node) = loop_node.filter(|n| n.parent() == Some(body)) else {
         return false;
     };
-    let statements = body.named_children(&mut body.walk()).collect::<Vec<_>>();
+    let statements = body
+        .named_code_children(&mut body.walk())
+        .collect::<Vec<_>>();
     let Some(position) = statements.iter().position(|n| *n == loop_node) else {
         return false;
     };
@@ -2250,9 +2255,11 @@ fn value_initialized_receiver(shape: tree_sitter::Node<'_>, file: &ParsedCppFile
         return false;
     };
     parameters
-        .named_children(&mut parameters.walk())
+        .named_code_children(&mut parameters.walk())
         .any(|parameter| {
-            if parameter.kind() != "parameter_declaration" || parameter.named_child_count() != 1 {
+            if parameter.kind() != "parameter_declaration"
+                || parameter.named_code_child_count() != 1
+            {
                 return false;
             }
             let Some(ty) = parameter
@@ -2266,7 +2273,7 @@ fn value_initialized_receiver(shape: tree_sitter::Node<'_>, file: &ParsedCppFile
             while let Some(scope) = ancestor {
                 if scope.kind() == "compound_statement" {
                     let preceding = scope
-                        .named_children(&mut scope.walk())
+                        .named_code_children(&mut scope.walk())
                         .filter(|n| n.end_byte() < shape.start_byte())
                         .collect::<Vec<_>>();
                     for declaration in preceding.into_iter().rev() {
@@ -3435,7 +3442,8 @@ fn bound_condition_variable_waits(
         let Some(arguments) = call.child_by_field_name("arguments") else {
             return;
         };
-        if ![predicate_position, predicate_position + 1].contains(&arguments.named_child_count())
+        if ![predicate_position, predicate_position + 1]
+            .contains(&arguments.named_code_child_count())
             || identifier_tokens(node_text(function, &file.source))
                 .any(|name| macros.contains(name))
         {
@@ -3474,8 +3482,8 @@ fn bound_condition_variable_waits(
                     access.field.clone(),
                 ));
             }
-            if arguments.named_child_count() == predicate_position + 1
-                && let Some(predicate) = arguments.named_child(predicate_position as u32)
+            if arguments.named_code_child_count() == predicate_position + 1
+                && let Some(predicate) = arguments.named_code_child(predicate_position as u32)
                 && predicate.kind() == "lambda_expression"
                 && !predicate.has_error()
                 && !identifier_tokens(node_text(predicate, &file.source)).any(|token| {
@@ -3534,7 +3542,7 @@ fn collect_scoped_locksets_with_waits(
             return;
         }
         let mut cursor = block.walk();
-        let statements = block.named_children(&mut cursor).collect::<Vec<_>>();
+        let statements = block.named_code_children(&mut cursor).collect::<Vec<_>>();
         for (index, statement) in statements.iter().enumerate() {
             let (guards, owner) = if statement.kind() == "declaration" {
                 let guards = scoped_lock_guard_ids(node_text(*statement, &file.source));
@@ -3557,7 +3565,7 @@ fn collect_scoped_locksets_with_waits(
                     })
                     && call
                         .child_by_field_name("arguments")
-                        .and_then(|arguments| arguments.named_child(0))
+                        .and_then(|arguments| arguments.named_code_child(0))
                         .is_some_and(|argument| {
                             argument.kind() == "identifier"
                                 && owner
@@ -3787,9 +3795,9 @@ fn statement_always_exits_function(node: tree_sitter::Node<'_>) -> bool {
     match node.kind() {
         "return_statement" | "throw_statement" => true,
         "compound_statement" => node
-            .named_child_count()
+            .named_code_child_count()
             .checked_sub(1)
-            .and_then(|index| node.named_child(index as u32))
+            .and_then(|index| node.named_code_child(index as u32))
             .is_some_and(statement_always_exits_function),
         _ => false,
     }
@@ -3814,8 +3822,8 @@ fn is_sequential_algorithm_callback(node: tree_sitter::Node<'_>, source: &str) -
         | "std::any_of" | "std::none_of" | "std::remove_if" => 3,
         _ => return false,
     };
-    arguments.named_child_count() == count
-        && arguments.named_child((count - 1) as u32) == Some(node)
+    arguments.named_code_child_count() == count
+        && arguments.named_code_child((count - 1) as u32) == Some(node)
 }
 
 fn terminating_error_branch<'a>(
@@ -3875,10 +3883,10 @@ fn checked_lock_acquisition(node: tree_sitter::Node<'_>, source: &str) -> Option
         condition.kind(),
         "condition_clause" | "parenthesized_expression"
     ) {
-        if condition.named_child_count() != 1 {
+        if condition.named_code_child_count() != 1 {
             return None;
         }
-        condition = condition.named_child(0)?;
+        condition = condition.named_code_child(0)?;
     }
     let call = if condition.kind() == "binary_expression" {
         if node_text(condition.child_by_field_name("operator")?, source) != "!=" {
@@ -3924,7 +3932,7 @@ fn scoped_lock_declaration_owner(
 /// interval, never to prove acquisition along every path.
 fn explicit_lock_operation(node: tree_sitter::Node<'_>, source: &str) -> Option<(bool, String)> {
     let call = if node.kind() == "expression_statement" {
-        node.named_child(0)?
+        node.named_code_child(0)?
     } else {
         node
     };
@@ -3952,7 +3960,7 @@ fn explicit_lock_operation(node: tree_sitter::Node<'_>, source: &str) -> Option<
         | "uv_mutex_unlock" => false,
         _ => return None,
     };
-    let argument = call.child_by_field_name("arguments")?.named_child(0)?;
+    let argument = call.child_by_field_name("arguments")?.named_code_child(0)?;
     Some((
         acquire,
         normalize_scalar_guard_id(node_text(argument, source))?,
@@ -4157,7 +4165,7 @@ fn ownership_parse_without_alignment_macros(
     macros: &HashMap<String, usize>,
 ) -> Option<ParsedCppFile> {
     let tree = file.tree.as_ref()?;
-    let mut source = file.source.as_bytes().to_vec();
+    let mut ranges = Vec::new();
     let mut changed = false;
     walk_nodes(tree.root_node(), &mut |node| {
         if matches!(node.kind(), "identifier" | "type_identifier")
@@ -4165,26 +4173,14 @@ fn ownership_parse_without_alignment_macros(
                 .get(node_text(node, &file.source))
                 .is_some_and(|begin| node.start_byte() >= *begin)
         {
-            source[node.byte_range()].fill(b' ');
+            ranges.push(node.byte_range());
             changed = true;
         }
     });
     if !changed {
         return None;
     }
-    let source = String::from_utf8(source).ok()?;
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_cpp::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(&source, None)?;
-    Some(ParsedCppFile {
-        path: file.path.clone(),
-        source,
-        tree: Some(tree),
-        is_c: file.is_c,
-        allow_internal_linkage_proof: file.allow_internal_linkage_proof,
-    })
+    file.reparse_masked_ranges(&ranges)
 }
 
 /// A native automatic array may be shared by an OpenMP team yet have no
@@ -4203,7 +4199,7 @@ fn serialized_worksharing_array(
         return false;
     }
     let blocks = scope
-        .named_children(&mut scope.walk())
+        .named_code_children(&mut scope.walk())
         .filter(|node| {
             node.kind() == "compound_statement"
                 && node.start_byte() > declaration.end_byte()
@@ -4706,7 +4702,7 @@ fn primitive_local_operand_at_depth(
         return false;
     }
     while operand.kind() == "parenthesized_expression" {
-        let Some(inner) = operand.named_child(0) else {
+        let Some(inner) = operand.named_code_child(0) else {
             return false;
         };
         operand = inner;
@@ -4726,7 +4722,7 @@ fn primitive_local_operand_at_depth(
     }
     let use_site = operand;
     while operand.kind() == "parenthesized_expression" {
-        let Some(inner) = operand.named_child(0) else {
+        let Some(inner) = operand.named_code_child(0) else {
             return false;
         };
         operand = inner;
@@ -4776,7 +4772,7 @@ fn primitive_local_operand_at_depth(
     while let Some(scope) = ancestor {
         if scope.kind() == "compound_statement" {
             let declarations = scope
-                .named_children(&mut scope.walk())
+                .named_code_children(&mut scope.walk())
                 .filter(|n| n.kind() == "declaration" && n.end_byte() < use_site.start_byte())
                 .collect::<Vec<_>>();
             for declaration in declarations.into_iter().rev() {
@@ -4821,7 +4817,7 @@ fn primitive_local_operand_at_depth(
             {
                 return false;
             }
-            for part in scope.named_children(&mut scope.walk()) {
+            for part in scope.named_code_children(&mut scope.walk()) {
                 if part.end_byte() < use_site.start_byte() {
                     let mut shadowed = false;
                     walk_nodes(part, &mut |node| {
@@ -4847,7 +4843,7 @@ fn primitive_local_operand_at_depth(
                 .child_by_field_name("declarator")
                 .and_then(|declarator| declarator.child_by_field_name("parameters"))
             {
-                for parameter in parameters.named_children(&mut parameters.walk()) {
+                for parameter in parameters.named_code_children(&mut parameters.walk()) {
                     if let Some(declarator) = parameter.child_by_field_name("declarator")
                         && declarator_variable_name(declarator, source).as_deref() == Some(name)
                     {
@@ -5639,7 +5635,9 @@ impl ScopedIndexedAliases {
                         }
                         let function = rhs.child_by_field_name("function")?;
                         let args = rhs.child_by_field_name("arguments")?;
-                        if args.named_child_count() != 0 || function.kind() != "field_expression" {
+                        if args.named_code_child_count() != 0
+                            || function.kind() != "field_expression"
+                        {
                             return None;
                         }
                         if node_text(function.child_by_field_name("field")?, &file.source) != "data"
@@ -5779,11 +5777,11 @@ fn bound_indexed_atomic_aliases(file: &ParsedCppFile) -> HashMap<usize, (String,
         };
         if name.kind() != "identifier"
             || !matches!(value.kind(), "argument_list" | "initializer_list")
-            || value.named_child_count() != 1
+            || value.named_code_child_count() != 1
         {
             return;
         }
-        let Some(element) = value.named_child(0) else {
+        let Some(element) = value.named_code_child(0) else {
             return;
         };
         if element.kind() != "subscript_expression" {
@@ -5841,9 +5839,9 @@ fn bound_indexed_atomic_aliases(file: &ParsedCppFile) -> HashMap<usize, (String,
         if changed {
             return;
         }
-        let mut next = declaration.next_named_sibling();
+        let mut next = declaration.next_named_code_sibling();
         while next.is_some_and(|n| n.kind() == "comment") {
-            next = next.and_then(|n| n.next_named_sibling());
+            next = next.and_then(|n| n.next_named_code_sibling());
         }
         let Some(next) = next else { return };
         if next.has_error() || !matches!(next.kind(), "expression_statement" | "declaration") {
@@ -6583,7 +6581,8 @@ fn source_aligned_type_names(files: &[ParsedCppFile], cache_line_size: usize) ->
     let mut names = HashSet::new();
     for line in files.iter().flat_map(|file| file.source.lines()) {
         let lower = line.to_ascii_lowercase();
-        let aligned = extract_align_bytes(line).is_some_and(|bytes| bytes >= cache_line_size);
+        let header = line.split('{').next().unwrap_or(line);
+        let aligned = extract_align_bytes(header).is_some_and(|bytes| bytes >= cache_line_size);
         if !aligned || !(line.contains('}') || lower.contains("struct") || lower.contains("class"))
         {
             continue;
@@ -6608,7 +6607,8 @@ fn source_declared_aligned_type_names(
         .flat_map(|file| file.source.lines())
         .filter(|line| {
             let lower = line.to_ascii_lowercase();
-            extract_align_bytes(line).is_some_and(|bytes| bytes >= cache_line_size)
+            extract_align_bytes(line.split('{').next().unwrap_or(line))
+                .is_some_and(|bytes| bytes >= cache_line_size)
                 && (lower.contains("struct") || lower.contains("class"))
         })
         .filter_map(aligned_type_name_from_line)
@@ -7274,7 +7274,7 @@ fn declared_private_index_methods(
                 return;
             };
             let mut private = node.kind() == "class_specifier";
-            for member in body.named_children(&mut body.walk()) {
+            for member in body.named_code_children(&mut body.walk()) {
                 if member.kind() == "access_specifier" {
                     private = node_text(member, &file.source).trim() == "private";
                 } else if member.has_error() || member.kind() == "ERROR" {
@@ -7350,7 +7350,7 @@ fn escaping_this_callback_owners(
                 return;
             }
             let Some(captures) = node
-                .named_children(&mut node.walk())
+                .named_code_children(&mut node.walk())
                 .find(|child| child.kind() == "lambda_capture_specifier")
             else {
                 return;
@@ -7553,7 +7553,7 @@ fn static_callback_wrapper_call_at_depth<'a>(
             function.child_by_field_name("name")?,
             function
                 .child_by_field_name("arguments")?
-                .named_child_count(),
+                .named_code_child_count(),
         )
     } else {
         (function, 0)
@@ -7567,7 +7567,7 @@ fn static_callback_wrapper_call_at_depth<'a>(
     while let Some(scope) = caller_scope {
         if (matches!(scope.kind(), "class_specifier" | "struct_specifier")
             && scope
-                .named_children(&mut scope.walk())
+                .named_code_children(&mut scope.walk())
                 .any(|n| n.kind() == "base_class_clause"))
             || (scope.kind() == "function_definition"
                 && scope
@@ -7580,7 +7580,7 @@ fn static_callback_wrapper_call_at_depth<'a>(
         caller_scope = scope.parent();
     }
     let position = arguments
-        .named_children(&mut arguments.walk())
+        .named_code_children(&mut arguments.walk())
         .position(|n| n == argument)?;
     let tree = file.tree.as_ref()?;
     let mut declarations = Vec::new();
@@ -7639,23 +7639,23 @@ fn static_callback_wrapper_call_at_depth<'a>(
         return None;
     }
     let params = declarator.child_by_field_name("parameters")?;
-    if params.named_child_count() != arguments.named_child_count() {
+    if params.named_code_child_count() != arguments.named_code_child_count() {
         return None;
     }
     if !synchronous_callbacks::preserves_callback_target(
-        params.named_child(u32::try_from(position).ok()?)?,
+        params.named_code_child(u32::try_from(position).ok()?)?,
         definition,
         file,
     ) {
         return None;
     }
     if explicit_types > 0 {
-        let parameter = params.named_child(u32::try_from(position).ok()?)?;
+        let parameter = params.named_code_child(u32::try_from(position).ok()?)?;
         let ty = node_text(parameter.child_by_field_name("type")?, &file.source);
         if field_access::without_template_arguments(ty).trim() != "std::function" {
             let template_parameters = definition.parent()?.child_by_field_name("parameters")?;
             let deduced_position = template_parameters
-                .named_children(&mut template_parameters.walk())
+                .named_code_children(&mut template_parameters.walk())
                 .position(|n| {
                     n.kind() == "type_parameter_declaration"
                         && identifier_tokens(node_text(n, &file.source)).last() == Some(ty)
@@ -7668,7 +7668,7 @@ fn static_callback_wrapper_call_at_depth<'a>(
         }
     }
     let parameter = params
-        .named_child(u32::try_from(position).ok()?)?
+        .named_code_child(u32::try_from(position).ok()?)?
         .child_by_field_name("declarator")?;
     let parameter = declarator_variable_name(parameter, &file.source)?;
     let mut safe = true;
@@ -7740,13 +7740,13 @@ struct IndexMethodInterface {
 
 fn index_base_names(node: tree_sitter::Node<'_>, source: &str) -> Option<Vec<String>> {
     let Some(clause) = node.child_by_field_name("base_class_clause").or_else(|| {
-        node.named_children(&mut node.walk())
+        node.named_code_children(&mut node.walk())
             .find(|child| child.kind() == "base_class_clause")
     }) else {
         return Some(Vec::new());
     };
     let mut bases = Vec::new();
-    for child in clause.named_children(&mut clause.walk()) {
+    for child in clause.named_code_children(&mut clause.walk()) {
         match child.kind() {
             "access_specifier" => {}
             "type_identifier" => bases.push(node_text(child, source).to_owned()),
@@ -7772,7 +7772,7 @@ fn index_method_interfaces(files: &[ParsedCppFile]) -> HashMap<String, Vec<Index
                 return;
             };
             let methods = body
-                .named_children(&mut body.walk())
+                .named_code_children(&mut body.walk())
                 .filter(|member| {
                     // A nonvirtual base member with the same spelling does
                     // not dispatch to a derived private helper. Implicit
@@ -7789,10 +7789,10 @@ fn index_method_interfaces(files: &[ParsedCppFile]) -> HashMap<String, Vec<Index
             // another virtual member or alter inheritance. Keep declaration
             // errors conservative without invalidating the whole interface
             // for an unrelated implementation-body parse error.
-            let incomplete_interface = body.named_children(&mut body.walk()).any(|member| {
+            let incomplete_interface = body.named_code_children(&mut body.walk()).any(|member| {
                 if member.kind() == "function_definition" {
                     member
-                        .named_children(&mut member.walk())
+                        .named_code_children(&mut member.walk())
                         .any(|part| part.kind() != "compound_statement" && part.has_error())
                 } else {
                     member.has_error() || member.kind() == "ERROR"
@@ -8114,7 +8114,7 @@ fn partition_value_declarator(
         }
         let Some(inner) = shape
             .child_by_field_name("declarator")
-            .or_else(|| shape.named_child(0))
+            .or_else(|| shape.named_code_child(0))
         else {
             return false;
         };
@@ -8126,7 +8126,7 @@ fn partition_value_declarator(
 /// Range queries and same-named methods on application objects are not IDs.
 fn sycl_item_identity_call(file: &ParsedCppFile, mut call: tree_sitter::Node<'_>) -> Option<bool> {
     while call.kind() == "parenthesized_expression" {
-        call = call.named_child(0)?;
+        call = call.named_code_child(0)?;
     }
     if call.kind() != "call_expression" {
         return None;
@@ -8196,7 +8196,7 @@ fn sycl_item_identity_call(file: &ParsedCppFile, mut call: tree_sitter::Node<'_>
             if shape.kind() == "reference_declarator" {
                 shape = shape
                     .child_by_field_name("declarator")
-                    .or_else(|| shape.named_child(0))?;
+                    .or_else(|| shape.named_code_child(0))?;
             }
             if shape.kind() != "identifier" {
                 return None;
@@ -8210,14 +8210,14 @@ fn sycl_item_identity_call(file: &ParsedCppFile, mut call: tree_sitter::Node<'_>
             }
             let arguments = call.child_by_field_name("arguments")?;
             if member.ends_with("linear_id") {
-                if arguments.named_child_count() != 0 {
+                if arguments.named_code_child_count() != 0 {
                     return None;
                 }
             } else {
-                if arguments.named_child_count() != 1 {
+                if arguments.named_code_child_count() != 1 {
                     return None;
                 }
-                let argument = arguments.named_child(0)?;
+                let argument = arguments.named_code_child(0)?;
                 if argument.kind() != "number_literal"
                     || node_text(argument, &file.source).parse::<usize>().ok()? >= dimension
                 {
@@ -8376,7 +8376,7 @@ fn collect_index_partition_origins_with_descriptors(
             modified |= target.is_some_and(|n| {
                 let mut n = n;
                 while n.kind() == "parenthesized_expression" {
-                    let Some(inner) = n.named_child(0) else {
+                    let Some(inner) = n.named_code_child(0) else {
                         break;
                     };
                     n = inner;
@@ -8410,7 +8410,7 @@ fn collect_index_partition_origins_with_descriptors(
             return;
         };
         let mut cursor = node.walk();
-        for argument in node.named_children(&mut cursor) {
+        for argument in node.named_code_children(&mut cursor) {
             origins.value_expressions.insert(
                 (
                     call.start_position().row + 1,
@@ -8437,7 +8437,7 @@ fn collect_index_partition_origins_with_descriptors(
         if node.kind() == "subscript_expression"
             && let Some(expression) = node
                 .child_by_field_name("indices")
-                .and_then(|indices| indices.named_child(0))
+                .and_then(|indices| indices.named_code_child(0))
         {
             origins.value_expressions.insert(
                 (
@@ -8810,7 +8810,7 @@ fn propagate_direct_partition_arguments(file: &ParsedCppFile, origins: &mut Inde
                 .child_by_field_name("parameters")
                 .map(|params| {
                     params
-                        .named_children(&mut params.walk())
+                        .named_code_children(&mut params.walk())
                         .map(|p| {
                             let ty = p
                                 .child_by_field_name("type")
@@ -8854,7 +8854,7 @@ fn propagate_direct_partition_arguments(file: &ParsedCppFile, origins: &mut Inde
         }
         let mut cursor = parameters.walk();
         let params = parameters
-            .named_children(&mut cursor)
+            .named_code_children(&mut cursor)
             .map(|parameter| {
                 let ty = parameter.child_by_field_name("type")?;
                 let formal = parameter.child_by_field_name("declarator")?;
@@ -8918,7 +8918,7 @@ fn propagate_direct_partition_arguments(file: &ParsedCppFile, origins: &mut Inde
             name.to_owned(),
             parent.start_position().row + 1,
             arguments
-                .named_children(&mut cursor)
+                .named_code_children(&mut cursor)
                 .map(|n| transparent_partition_value(n, &file.source))
                 .collect::<Vec<_>>(),
         ));
@@ -9085,7 +9085,7 @@ fn propagate_local_callback_partition_arguments(
                 return;
             };
             let args = arguments
-                .named_children(&mut arguments.walk())
+                .named_code_children(&mut arguments.walk())
                 .collect::<Vec<_>>();
             if args.len() != parameters.len() {
                 safe = false;
@@ -9246,7 +9246,7 @@ fn local_callback_has_only_sequential_data_calls(
             return;
         };
         if arguments
-            .named_children(&mut arguments.walk())
+            .named_code_children(&mut arguments.walk())
             .any(|argument| {
                 origins.supports(
                     node_text(argument, &file.source),
@@ -9335,7 +9335,7 @@ fn transparent_partition_value(node: tree_sitter::Node<'_>, source: &str) -> Str
             format!("{} {operator} {}", value("left"), value("right"))
         }
         "parenthesized_expression" => node
-            .named_child(0)
+            .named_code_child(0)
             .map(|child| transparent_partition_value(child, source))
             .unwrap_or_default(),
         "cast_expression" => node
@@ -10492,7 +10492,7 @@ fn extend_static_helper_execution(file: &ParsedCppFile, concurrent: &mut HashSet
         let file_local = node
             .parent()
             .is_some_and(|parent| parent.kind() == "translation_unit")
-            && node.named_children(&mut node.walk()).any(|child| {
+            && node.named_code_children(&mut node.walk()).any(|child| {
                 child.kind() == "storage_class_specifier"
                     && node_text(child, &file.source) == "static"
             });
@@ -11673,23 +11673,12 @@ fn concurrent_context_lines(file: &ParsedCppFile) -> HashSet<usize> {
             if !insertions.is_empty() {
                 insertions.sort_unstable();
                 insertions.dedup();
-                let mut source = file.source.clone();
-                for offset in insertions.into_iter().rev() {
-                    source.insert_str(offset, "()");
-                }
-                let mut parser = tree_sitter::Parser::new();
-                if parser
-                    .set_language(&tree_sitter_cpp::LANGUAGE.into())
-                    .is_ok()
-                    && let Some(tree) = parser.parse(&source, None)
-                {
-                    lines.extend(concurrent_context_lines(&ParsedCppFile {
-                        is_c: file.is_c,
-                        allow_internal_linkage_proof: file.allow_internal_linkage_proof,
-                        path: file.path.clone(),
-                        source,
-                        tree: Some(tree),
-                    }));
+                let edits = insertions
+                    .into_iter()
+                    .map(|offset| (offset, offset, "()".to_string()))
+                    .collect::<Vec<_>>();
+                if let Some(view) = file.reparse_with_edits(&edits) {
+                    lines.extend(concurrent_context_lines(&view));
                 }
             }
         }
@@ -11702,7 +11691,7 @@ fn concurrent_context_lines(file: &ParsedCppFile) -> HashSet<usize> {
             let mut constructor_callback = false;
             while let Some(parent) = ancestor {
                 if matches!(parent.kind(), "argument_list" | "initializer_list")
-                    && parent.named_child(0) == Some(node)
+                    && parent.named_code_child(0) == Some(node)
                 {
                     constructor_callback = true;
                 }
@@ -11746,7 +11735,7 @@ fn concurrent_context_lines(file: &ParsedCppFile) -> HashSet<usize> {
                         .unwrap_or("");
                     let policy = parent
                         .child_by_field_name("arguments")
-                        .and_then(|arguments| arguments.named_child(0))
+                        .and_then(|arguments| arguments.named_code_child(0))
                         .map(|argument| node_text(argument, &file.source))
                         .unwrap_or("");
                     parallel_call = contains_concurrency_token(callee)
@@ -11797,56 +11786,67 @@ fn concurrent_context_lines(file: &ParsedCppFile) -> HashSet<usize> {
         // as concurrent creates spurious indexed-write conflicts.
         // Named entry functions still need their own body marked.  Resolve only
         // the first constructor argument, which is the callable position.
-        let mut in_block_comment = false;
-        for source_line in file.source.lines() {
-            let mut code = String::new();
-            let mut remainder = source_line;
-            while !remainder.is_empty() {
-                if in_block_comment {
-                    let Some(end) = remainder.find("*/") else {
-                        remainder = "";
-                        continue;
-                    };
-                    in_block_comment = false;
-                    remainder = &remainder[end + 2..];
-                } else if let Some(start) = remainder.find("/*") {
-                    code.push_str(&remainder[..start]);
-                    in_block_comment = true;
-                    remainder = &remainder[start + 2..];
-                } else {
-                    code.push_str(remainder);
-                    remainder = "";
+        walk_nodes(tree.root_node(), &mut |node| {
+            let thread_type = |ty: tree_sitter::Node<'_>| {
+                matches!(
+                    node_text(ty, &file.source)
+                        .split_whitespace()
+                        .collect::<String>()
+                        .trim_start_matches("::"),
+                    "std::thread" | "std::jthread"
+                )
+            };
+            let mut callbacks = Vec::new();
+            if node.kind() == "declaration"
+                && node.child_by_field_name("type").is_some_and(thread_type)
+            {
+                for declarator in node.children_by_field_name("declarator", &mut node.walk()) {
+                    let arguments = declarator.child_by_field_name("parameters").or_else(|| {
+                        declarator.child_by_field_name("value").filter(|value| {
+                            matches!(value.kind(), "argument_list" | "initializer_list")
+                        })
+                    });
+                    if let Some(callback) =
+                        arguments.and_then(|arguments| arguments.named_code_child(0))
+                    {
+                        callbacks.push(callback);
+                    }
+                }
+            } else if matches!(node.kind(), "call_expression" | "new_expression") {
+                let callee = node
+                    .child_by_field_name("function")
+                    .or_else(|| node.child_by_field_name("type"));
+                if callee.is_some_and(thread_type)
+                    && let Some(callback) = node
+                        .child_by_field_name("arguments")
+                        .and_then(|arguments| arguments.named_code_child(0))
+                {
+                    callbacks.push(callback);
                 }
             }
-            let code = code
-                .split_once("//")
-                .map_or(code.as_str(), |(code, _)| code);
-            let source_line = code;
-            let trimmed = source_line.trim_start();
-            if trimmed.starts_with("//")
-                || trimmed.is_empty()
-                || (!source_line.contains("std::thread") && !source_line.contains("std::jthread"))
-            {
-                continue;
+            for callback in callbacks {
+                // Named callables are resolved at their actual constructor
+                // position. A wrapper call or a string is not a named entry.
+                let name = node_text(callback, &file.source)
+                    .trim()
+                    .trim_start_matches('&')
+                    .trim();
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':'))
+                {
+                    continue;
+                }
+                let name = name.rsplit("::").next().unwrap_or(name);
+                let mut matching = functions.iter().filter(|function| function.name == name);
+                if let Some(function) = matching.next()
+                    && matching.next().is_none()
+                {
+                    lines.extend(function.body_start_line..=function.body_end_line);
+                }
             }
-            let Some(open) = source_line.find(['(', '{']) else {
-                continue;
-            };
-            let remainder = &source_line[open + 1..];
-            let callback = remainder
-                .split([',', ')', '}'])
-                .next()
-                .map(str::trim)
-                .and_then(|value| value.split_whitespace().last())
-                .map(|value| value.trim_matches('&'));
-            let Some(callback) = callback else { continue };
-            if callback.is_empty() || callback.contains('[') || callback.contains('(') {
-                continue;
-            }
-            if let Some(function) = functions.iter().find(|function| function.name == callback) {
-                lines.extend(function.body_start_line..=function.body_end_line);
-            }
-        }
+        });
     } else {
         for (idx, line) in file.source.lines().enumerate() {
             // OpenMP pragmas are handled below with the exact controlled
@@ -12128,7 +12128,7 @@ fn declarator_variable_name(node: tree_sitter::Node<'_>, source: &str) -> Option
             return Some(node_text(candidate, source).to_string());
         }
         let mut cursor = candidate.walk();
-        let children: Vec<_> = candidate.named_children(&mut cursor).collect();
+        let children: Vec<_> = candidate.named_code_children(&mut cursor).collect();
         pending.extend(children.into_iter().rev());
     }
     None
@@ -12213,7 +12213,7 @@ fn collect_implicit_record_lines(
             }
         }
         let mut cursor = node.walk();
-        let children = node.children(&mut cursor).collect::<Vec<_>>();
+        let children = node.code_children(&mut cursor).collect::<Vec<_>>();
         pending.extend(
             children
                 .into_iter()

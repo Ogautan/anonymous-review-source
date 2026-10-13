@@ -1,4 +1,5 @@
 //! Source-backed summaries for wrappers around the BPF map API.
+use crate::cpp_detection::parser::CodeChildren;
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
@@ -87,7 +88,7 @@ pub(super) fn collect(file: &ParsedCppFile) -> HashMap<String, MapWrite> {
                 continue;
             };
             let parameters: Vec<_> = parameters
-                .named_children(&mut parameters.walk())
+                .named_code_children(&mut parameters.walk())
                 .filter_map(|node| {
                     node.child_by_field_name("declarator")
                         .and_then(|node| name(node, &file.source))
@@ -117,8 +118,9 @@ pub(super) fn collect(file: &ParsedCppFile) -> HashMap<String, MapWrite> {
                     let Some(arguments) = node.child_by_field_name("arguments") else {
                         return;
                     };
-                    let arguments: Vec<_> =
-                        arguments.named_children(&mut arguments.walk()).collect();
+                    let arguments: Vec<_> = arguments
+                        .named_code_children(&mut arguments.walk())
+                        .collect();
                     if let Some(summary) = previous.get(callee) {
                         if let (Some(map), Some(key)) = (
                             arguments.get(summary.map_argument),

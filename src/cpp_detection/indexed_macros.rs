@@ -1,6 +1,7 @@
 //! Source-backed effects of simple function-like synchronization macros.
 //! Names do not establish effects; only a visible, unique replacement body
 //! invoking a modelled primitive does. No general preprocessor emulation.
+use crate::cpp_detection::parser::CodeChildren;
 
 use super::*;
 
@@ -185,7 +186,7 @@ pub(super) fn collect(files: &[ParsedCppFile]) -> Effects {
                 return;
             }
             let arguments = arguments
-                .named_children(&mut arguments.walk())
+                .named_code_children(&mut arguments.walk())
                 .filter(|arg| arg.kind() != "comment")
                 .map(|arg| node_text(arg, &file.source).to_owned())
                 .collect();

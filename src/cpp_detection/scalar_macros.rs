@@ -1,6 +1,7 @@
 //! Bounded nonescape contracts for visible scalar-only function-like macros.
 //! No macro name is assigned semantics; ambiguous or opaque bodies fail closed.
 use super::*;
+use crate::cpp_detection::parser::CodeChildren;
 
 /// Object macros consisting solely of a decimal integer (optionally wrapped
 /// in parentheses). No identifiers, type substitutions or token pasting can
@@ -166,15 +167,15 @@ fn size_query_body(body: &str, params: &HashSet<String>) -> bool {
         match node.kind() {
             "identifier" => params.contains(node_text(node, source)),
             "parenthesized_expression" => node
-                .named_child(0)
+                .named_code_child(0)
                 .is_some_and(|n| operand(n, source, params)),
             "subscript_expression" => {
                 node.child_by_field_name("argument")
                     .is_some_and(|n| operand(n, source, params))
                     && node.child_by_field_name("indices").is_some_and(|indices| {
-                        indices.named_child_count() == 1
+                        indices.named_code_child_count() == 1
                             && indices
-                                .named_child(0)
+                                .named_code_child(0)
                                 .is_some_and(|n| n.kind() == "number_literal")
                     })
             }
@@ -185,7 +186,7 @@ fn size_query_body(body: &str, params: &HashSet<String>) -> bool {
         match node.kind() {
             "number_literal" => true,
             "parenthesized_expression" => node
-                .named_child(0)
+                .named_code_child(0)
                 .is_some_and(|n| expression(n, source, params)),
             "sizeof_expression" => node
                 .child_by_field_name("value")
@@ -212,12 +213,12 @@ fn size_query_body(body: &str, params: &HashSet<String>) -> bool {
         return false;
     }
     tree.root_node()
-        .named_child(0)
+        .named_code_child(0)
         .and_then(|f| f.child_by_field_name("body"))
-        .filter(|b| b.named_child_count() == 1)
-        .and_then(|b| b.named_child(0))
+        .filter(|b| b.named_code_child_count() == 1)
+        .and_then(|b| b.named_code_child(0))
         .filter(|s| s.kind() == "expression_statement")
-        .and_then(|s| s.named_child(0))
+        .and_then(|s| s.named_code_child(0))
         .is_some_and(|n| expression(n, &source, params))
 }
 
@@ -269,7 +270,7 @@ fn scalar_body(body: &str, mut names: HashSet<String>) -> bool {
     }
     let Some(body) = tree
         .root_node()
-        .named_child(0)
+        .named_code_child(0)
         .and_then(|f| f.child_by_field_name("body"))
     else {
         return false;
@@ -346,7 +347,7 @@ pub(in crate::cpp_detection) fn is_scalar_call(
                 && call.start_byte() < contract.undef_byte
                 && call
                     .child_by_field_name("arguments")
-                    .is_some_and(|args| args.named_child_count() == contract.arity)
+                    .is_some_and(|args| args.named_code_child_count() == contract.arity)
         })
 }
 
@@ -371,15 +372,15 @@ pub(in crate::cpp_detection) fn preserves_array(
     };
     if call.start_byte() < contract.end_byte
         || call.start_byte() >= contract.undef_byte
-        || arguments.named_child_count() != contract.arity
+        || arguments.named_code_child_count() != contract.arity
     {
         return false;
     }
     arguments
-        .named_children(&mut arguments.walk())
+        .named_code_children(&mut arguments.walk())
         .all(|mut arg| {
             while arg.kind() == "parenthesized_expression" {
-                let Some(inner) = arg.named_child(0) else {
+                let Some(inner) = arg.named_code_child(0) else {
                     return false;
                 };
                 arg = inner;

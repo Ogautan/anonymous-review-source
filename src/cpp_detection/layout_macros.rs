@@ -1,6 +1,7 @@
 //! Bounded numeric source defaults for record alignment annotations.
 //! Follow direct quoted includes and join both unknown preprocessor branches.
 //! This is an alignment lower bound, not an exact target/ABI layout.
+use crate::cpp_detection::parser::CodeChildren;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -243,7 +244,7 @@ fn scoped_literal_constant(
         return None;
     }
     let children = declaration
-        .named_children(&mut declaration.walk())
+        .named_code_children(&mut declaration.walk())
         .collect::<Vec<_>>();
     if !children.iter().any(|n| {
         n.kind() == "type_qualifier" && matches!(node_text(*n, &file.source), "const" | "constexpr")
@@ -267,7 +268,7 @@ fn scoped_literal_constant(
     }
     let mut value = declarator.child_by_field_name("value")?;
     while value.kind() == "parenthesized_expression" {
-        value = value.named_child(0)?;
+        value = value.named_code_child(0)?;
     }
     if value.kind() != "number_literal" {
         return None;

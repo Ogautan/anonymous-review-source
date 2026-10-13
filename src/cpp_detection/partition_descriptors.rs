@@ -1,5 +1,6 @@
 //! Positional contracts for immutable scalar descriptors on concrete call paths.
 use super::*;
+use crate::cpp_detection::parser::CodeChildren;
 use tree_sitter::Node;
 
 pub(super) struct DeclarationAnnotations(HashSet<String>);
@@ -78,16 +79,12 @@ impl DeclarationAnnotations {
     }
 
     pub(super) fn api_fields(&self, file: &ParsedCppFile) -> HashMap<String, HashSet<String>> {
-        let mut source = file.source.as_bytes().to_vec();
+        let mut ranges = Vec::new();
         let mut offset = 0;
         let mut changed = false;
         for line in file.source.split_inclusive('\n') {
             if self.0.contains(line.trim()) {
-                for byte in &mut source[offset..offset + line.len()] {
-                    if !matches!(*byte, b'\n' | b'\r') {
-                        *byte = b' ';
-                    }
-                }
+                ranges.push(offset..offset + line.len());
                 changed = true;
             }
             offset += line.len();
@@ -95,22 +92,8 @@ impl DeclarationAnnotations {
         if !changed {
             return api_fields(file);
         }
-        let source = String::from_utf8(source).expect("only ASCII annotation lines replaced");
-        let mut parser = tree_sitter::Parser::new();
-        if parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .is_err()
-        {
-            return api_fields(file);
-        }
-        let tree = parser.parse(&source, None);
-        api_fields(&ParsedCppFile {
-            path: file.path.clone(),
-            source,
-            tree,
-            is_c: file.is_c,
-            allow_internal_linkage_proof: file.allow_internal_linkage_proof,
-        })
+        file.reparse_masked_ranges(&ranges)
+            .map_or_else(|| api_fields(file), |view| api_fields(&view))
     }
 }
 
@@ -226,9 +209,10 @@ pub(super) fn api_fields(file: &ParsedCppFile) -> HashMap<String, HashSet<String
                 continue;
             };
             for initializer in children(initializers) {
-                let (Some(field), Some(values)) =
-                    (initializer.named_child(0), initializer.named_child(1))
-                else {
+                let (Some(field), Some(values)) = (
+                    initializer.named_code_child(0),
+                    initializer.named_code_child(1),
+                ) else {
                     continue;
                 };
                 let field = node_text(field, &file.source);
@@ -256,7 +240,7 @@ struct Contract {
 }
 
 fn children(node: Node<'_>) -> Vec<Node<'_>> {
-    node.named_children(&mut node.walk())
+    node.named_code_children(&mut node.walk())
         .filter(|n| n.kind() != "comment")
         .collect()
 }
@@ -334,11 +318,11 @@ fn contract(node: Node<'_>, source: &str) -> Option<(String, Contract)> {
         .find(|n| n.kind() == "field_initializer_list")?;
     let mut mapped = Vec::new();
     for initializer in children(list) {
-        let field = node_text(initializer.named_child(0)?, source);
+        let field = node_text(initializer.named_code_child(0)?, source);
         if !fields.contains(field) {
             return None;
         }
-        let values = children(initializer.named_child(1)?);
+        let values = children(initializer.named_code_child(1)?);
         let [value] = values.as_slice() else {
             return None;
         };
@@ -452,7 +436,7 @@ pub(super) fn propagate(file: &ParsedCppFile, origins: &mut IndexPartitionOrigin
         if statement.kind() != "return_statement" {
             continue;
         }
-        let Some(value) = statement.named_child(0) else {
+        let Some(value) = statement.named_code_child(0) else {
             continue;
         };
         let Some((constructor, args)) = direct_call(value, &file.source) else {
@@ -517,12 +501,12 @@ pub(super) fn propagate(file: &ParsedCppFile, origins: &mut IndexPartitionOrigin
         };
         // No intervening action can replace the descriptor or hide an alias.
         let Some(next) = declaration
-            .next_named_sibling()
+            .next_named_code_sibling()
             .filter(|n| n.kind() == "expression_statement")
         else {
             return;
         };
-        let Some(call) = next.named_child(0) else {
+        let Some(call) = next.named_code_child(0) else {
             return;
         };
         let Some((callee, args)) = direct_call(call, &file.source) else {

@@ -9,6 +9,7 @@ pub mod pattern_model;
 pub mod root_cause;
 pub mod rules;
 mod rust_findings;
+mod rust_indices;
 mod rust_macros;
 mod rust_statics;
 mod rust_storage;

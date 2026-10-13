@@ -390,28 +390,9 @@ pub(super) fn views(
         if edits.is_empty() || edits.windows(2).any(|pair| pair[0].1 > pair[1].0) {
             continue;
         }
-        let mut source = file.source.clone();
-        for (start, end, replacement) in edits.into_iter().rev() {
-            source.replace_range(start..end, &replacement);
+        if let Some(view) = file.reparse_with_edits(&edits) {
+            result.insert(file.path.clone(), view);
         }
-        let mut parser = tree_sitter::Parser::new();
-        if parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .is_err()
-        {
-            continue;
-        }
-        let tree = parser.parse(&source, None);
-        result.insert(
-            file.path.clone(),
-            ParsedCppFile {
-                path: file.path.clone(),
-                source,
-                tree,
-                is_c: file.is_c,
-                allow_internal_linkage_proof: file.allow_internal_linkage_proof,
-            },
-        );
     }
     result
 }

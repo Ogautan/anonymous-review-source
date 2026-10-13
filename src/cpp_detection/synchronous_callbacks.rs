@@ -1,6 +1,7 @@
 //! Source-backed callback contracts. Names locate declarations; only the
 //! selected parameter's uses in a unique definition establish synchrony.
 use super::*;
+use crate::cpp_detection::parser::CodeChildren;
 use tree_sitter::Node;
 
 #[derive(Default)]
@@ -71,7 +72,7 @@ fn declaration_name(node: Node<'_>, file: &ParsedCppFile) -> Option<String> {
         if scope.kind() == "lambda_expression"
             || (scope.kind() == "template_declaration"
                 && !scope
-                    .named_children(&mut scope.walk())
+                    .named_code_children(&mut scope.walk())
                     .any(|child| matches!(child.kind(), "function_definition" | "declaration")))
         {
             return None;
@@ -209,7 +210,7 @@ pub(super) fn collect(files: &[ParsedCppFile]) -> Contracts {
         };
         let definition = declarator.parent().unwrap();
         if !parameters
-            .named_children(&mut parameters.walk())
+            .named_code_children(&mut parameters.walk())
             .any(|parameter| preserves_callback_target(parameter, definition, file))
         {
             continue;
@@ -232,7 +233,7 @@ pub(super) fn collect(files: &[ParsedCppFile]) -> Contracts {
             continue;
         };
         let shapes = parameters
-            .named_children(&mut parameters.walk())
+            .named_code_children(&mut parameters.walk())
             .map(|n| parameter_shape(n, file, &result))
             .collect::<Option<Vec<_>>>();
         let Some(shapes) = shapes else {
@@ -244,7 +245,7 @@ pub(super) fn collect(files: &[ParsedCppFile]) -> Contracts {
             node.has_error()
                 || node.child_by_field_name("parameters").is_none_or(|params| {
                     params
-                        .named_children(&mut params.walk())
+                        .named_code_children(&mut params.walk())
                         .map(|p| parameter_shape(p, other_file, &result))
                         .collect::<Option<Vec<_>>>()
                         .as_ref()
@@ -271,7 +272,7 @@ pub(super) fn collect(files: &[ParsedCppFile]) -> Contracts {
                 if matches!(scope.kind(), "class_specifier" | "struct_specifier") {
                     return !scope.has_error()
                         && !scope
-                            .named_children(&mut scope.walk())
+                            .named_code_children(&mut scope.walk())
                             .any(|child| child.kind() == "base_class_clause")
                         && scope
                             .parent()
@@ -286,7 +287,7 @@ pub(super) fn collect(files: &[ParsedCppFile]) -> Contracts {
         }
         let concurrent = concurrent_context_lines(file);
         for (position, parameter) in parameters
-            .named_children(&mut parameters.walk())
+            .named_code_children(&mut parameters.walk())
             .enumerate()
         {
             // Unknown user-defined callback conversions/operators can publish
@@ -353,7 +354,7 @@ pub(super) fn collect(files: &[ParsedCppFile]) -> Contracts {
                 if !standard_function {
                     result.deduced_positions.insert((
                         name.clone(),
-                        parameters.named_child_count(),
+                        parameters.named_code_child_count(),
                         position,
                     ));
                 }
@@ -361,7 +362,7 @@ pub(super) fn collect(files: &[ParsedCppFile]) -> Contracts {
                     .positions
                     .entry(name.clone())
                     .or_default()
-                    .insert((parameters.named_child_count(), position));
+                    .insert((parameters.named_code_child_count(), position));
             }
         }
     }
@@ -438,14 +439,14 @@ impl Contracts {
             &resolved
         };
         let position = arguments
-            .named_children(&mut arguments.walk())
+            .named_code_children(&mut arguments.walk())
             .position(|n| n == argument)?;
         // Only `auto value = [..] {..}` guarantees template deduction preserves
         // this closure. A user-defined converting wrapper may publish it.
         if !deduced_lambda
             && self.deduced_positions.contains(&(
                 name.to_owned(),
-                arguments.named_child_count(),
+                arguments.named_code_child_count(),
                 position,
             ))
         {
@@ -453,7 +454,7 @@ impl Contracts {
         }
         self.positions
             .get(name)?
-            .contains(&(arguments.named_child_count(), position))
+            .contains(&(arguments.named_code_child_count(), position))
             .then_some(call)
     }
 }

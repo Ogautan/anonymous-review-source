@@ -2,6 +2,7 @@
 //! not a storage identity: an atomic_ref::fetch_add must not borrow a table's
 //! same-named indexed write. Unknown receiver types yield no positive evidence.
 use super::*;
+use crate::cpp_detection::parser::CodeChildren;
 use tree_sitter::Node;
 
 pub(super) type Calls = HashMap<(usize, String, Option<usize>), Vec<Vec<String>>>;
@@ -95,7 +96,7 @@ fn receiver_owner(
             field_access::type_record_in_scope(&field.ty_str, file, index, Some(parent))
         }
         "parenthesized_expression" | "pointer_expression" => {
-            receiver_owner(node.named_child(0)?, file, index, bindings, owner)
+            receiver_owner(node.named_code_child(0)?, file, index, bindings, owner)
         }
         _ => None,
     }
@@ -196,7 +197,7 @@ pub(super) fn collect_spans(file: &ParsedCppFile, index: &EvidenceIndex<'_>) -> 
             return;
         };
         let args = arguments
-            .named_children(&mut arguments.walk())
+            .named_code_children(&mut arguments.walk())
             .filter(|arg| arg.kind() != "comment")
             .map(|arg| node_text(arg, &file.source).to_owned())
             .collect();

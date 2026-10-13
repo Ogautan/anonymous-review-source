@@ -2,6 +2,7 @@
 //! Unknown control flow and arithmetic invalidate the proof, not the candidate.
 use super::super::parser::{ParsedCppFile, node_text, walk_nodes};
 use super::call_argument_lists;
+use crate::cpp_detection::parser::CodeChildren;
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
@@ -195,7 +196,8 @@ pub(super) fn separated_accesses(file: &ParsedCppFile, block: usize) -> HashSet<
                 let Some(args) = call.child_by_field_name("arguments") else {
                     return;
                 };
-                let (Some(map), Some(key)) = (args.named_child(0), args.named_child(1)) else {
+                let (Some(map), Some(key)) = (args.named_code_child(0), args.named_code_child(1))
+                else {
                     return;
                 };
                 let map_name = node_text(map, &file.source)
@@ -253,7 +255,7 @@ pub(super) fn separated_accesses(file: &ParsedCppFile, block: usize) -> HashSet<
                     });
                     let mut cursor = statement.walk();
                     for decl in statement
-                        .named_children(&mut cursor)
+                        .named_code_children(&mut cursor)
                         .filter(|n| matches!(n.kind(), "identifier" | "init_declarator"))
                     {
                         let name = decl.child_by_field_name("declarator").unwrap_or(decl);
@@ -298,7 +300,7 @@ pub(super) fn separated_accesses(file: &ParsedCppFile, block: usize) -> HashSet<
                     invalidate_effects(statement, file, &mut values, &declared_calls, &map_writes);
                 }
                 "expression_statement" => {
-                    let Some(expr) = statement.named_child(0) else {
+                    let Some(expr) = statement.named_code_child(0) else {
                         continue;
                     };
                     if expr.kind() == "assignment_expression" {
@@ -340,7 +342,7 @@ pub(super) fn separated_accesses(file: &ParsedCppFile, block: usize) -> HashSet<
                             && let Some(args) = expr.child_by_field_name("arguments")
                         {
                             let mut cursor = args.walk();
-                            let args: Vec<_> = args.named_children(&mut cursor).collect();
+                            let args: Vec<_> = args.named_code_children(&mut cursor).collect();
                             let summary = &map_writes[callee];
                             if args.len() > summary.map_argument.max(summary.key_argument) {
                                 let map = node_text(args[summary.map_argument], &file.source)
@@ -394,7 +396,7 @@ pub(super) fn separated_accesses(file: &ParsedCppFile, block: usize) -> HashSet<
             .unwrap_or("");
         if map_writes.contains_key(name)
             && let Some(args) = n.child_by_field_name("arguments")
-            && let Some(map) = args.named_child(map_writes[name].map_argument as u32)
+            && let Some(map) = args.named_code_child(map_writes[name].map_argument as u32)
         {
             let map = node_text(map, &file.source)
                 .trim()
@@ -537,7 +539,7 @@ fn branch_steps<'a>(node: Node<'a>, steps: &mut Vec<Step<'a>>, depth: usize) {
     if node.kind() == "compound_statement" {
         steps.push(Step::Save);
         let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
+        for child in node.named_code_children(&mut cursor) {
             branch_steps(child, steps, depth + 1);
         }
         steps.push(Step::Restore);
@@ -554,7 +556,7 @@ fn branch_steps<'a>(node: Node<'a>, steps: &mut Vec<Step<'a>>, depth: usize) {
             if let Some(arm) = node.child_by_field_name("alternative") {
                 steps.push(Step::Save);
                 if arm.kind() == "else_clause" {
-                    if let Some(child) = arm.named_child(0) {
+                    if let Some(child) = arm.named_code_child(0) {
                         branch_steps(child, steps, depth + 1);
                     }
                 } else {
@@ -578,7 +580,7 @@ fn refine_upper_bound(
     forbidden: &HashSet<String>,
 ) {
     while matches!(node.kind(), "condition_clause" | "parenthesized_expression") {
-        let Some(child) = node.named_child(0) else {
+        let Some(child) = node.named_code_child(0) else {
             return;
         };
         node = child;
@@ -629,13 +631,16 @@ fn readonly_map_input(node: Node<'_>, file: &ParsedCppFile) -> bool {
         .map(|n| node_text(n, &file.source))
         .unwrap_or("");
     (callee == "bpf_map_update_elem"
-        && args.named_child_count() == 4
-        && [1, 2]
-            .into_iter()
-            .any(|i| args.named_child(i).is_some_and(|n| n.id() == node.id())))
+        && args.named_code_child_count() == 4
+        && [1, 2].into_iter().any(|i| {
+            args.named_code_child(i)
+                .is_some_and(|n| n.id() == node.id())
+        }))
         || (callee == "bpf_map_lookup_elem"
-            && args.named_child_count() == 2
-            && args.named_child(1).is_some_and(|n| n.id() == node.id()))
+            && args.named_code_child_count() == 2
+            && args
+                .named_code_child(1)
+                .is_some_and(|n| n.id() == node.id()))
 }
 
 fn invalidate_effects(
@@ -717,11 +722,14 @@ fn affine(
                 .unwrap_or_else(|| constants.get(name).copied())
         }
         "number_literal" => integer(node_text(node, &file.source)).map(|n| (0, n, n)),
-        "parenthesized_expression" => recurse(node.named_child(0)?),
+        "parenthesized_expression" => recurse(node.named_code_child(0)?),
         "call_expression"
             if node_text(node.child_by_field_name("function")?, &file.source)
                 == "bpf_get_smp_processor_id"
-                && node.child_by_field_name("arguments")?.named_child_count() == 0 =>
+                && node
+                    .child_by_field_name("arguments")?
+                    .named_code_child_count()
+                    == 0 =>
         {
             Some((1, 0, 0))
         }

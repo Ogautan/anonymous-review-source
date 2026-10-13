@@ -224,8 +224,8 @@ fn cache_sensitive_field_findings(
     let has_evidence = evidence.is_some_and(ConcurrencyEvidenceSet::has_evidence);
     let mut findings = Vec::new();
 
-    if options.candidate_enabled(CandidateKind::ContainerElements)
-        && let Some(field) = si.fields.iter().find(|field| {
+    if options.candidate_enabled(CandidateKind::ContainerElements) {
+        for field in si.fields.iter().filter(|field| {
             is_unisolated_hot_field(field)
                 && contiguous_element_type(&field.ty_str).is_some()
                 && !contiguous_elements_are_isolated(si, field, structs)
@@ -236,26 +236,30 @@ fn cache_sensitive_field_findings(
                     || field.ty_str.contains("RwLock")
                     || field.ty_str.contains("Atomic")
                     || field.ty_str.contains("SeqLock"))
-        })
-        && let Some(assessment) =
-            assess_container_risk(si, field, has_evidence, evidence_descs, evidence, api_usage)
-    {
-        let locations = vec![format!("{}[i]", field.name), format!("{}[j]", field.name)];
-        let pattern = build_pattern_context(
-            Some(si),
-            CandidateKind::ContainerElements,
-            locations,
-            ColocationPattern::ContiguousElements,
-            true,
-            evidence,
-            api_usage,
-            true,
-            None,
-            assessment.repetition_evidence,
-            true,
-        );
-        if core_predicate_holds(&pattern) {
-            findings.push(with_risk_factors(
+        }) {
+            let Some(locations) = container_element_locations(si, field, evidence) else {
+                continue;
+            };
+            let Some(assessment) =
+                assess_container_risk(si, field, has_evidence, evidence_descs, evidence, api_usage)
+            else {
+                continue;
+            };
+            let pattern = build_pattern_context(
+                Some(si),
+                CandidateKind::ContainerElements,
+                locations,
+                ColocationPattern::ContiguousElements,
+                true,
+                evidence,
+                api_usage,
+                true,
+                None,
+                assessment.repetition_evidence,
+                true,
+            );
+            if core_predicate_holds(&pattern) {
+                findings.push(with_risk_factors(
                 make_finding(
                     assessment.category,
                     CandidateKind::ContainerElements,
@@ -276,6 +280,7 @@ fn cache_sensitive_field_findings(
                 .with_static_pattern(pattern),
                 assessment.risk_factors,
             ));
+            }
         }
     }
 
@@ -1885,6 +1890,120 @@ fn contiguous_element_spelling(ty: &str) -> Option<String> {
         return None;
     };
     Some(inner.to_string())
+}
+
+/// A container type cannot manufacture a peer access. Retain actual index
+/// constraints and require a write in the same element-storage domain.
+fn container_element_locations(
+    si: &StructInfo,
+    field: &FieldInfo,
+    evidence: Option<&ConcurrencyEvidenceSet>,
+) -> Option<Vec<String>> {
+    fn array_length(ty: &syn::Type) -> Option<usize> {
+        match ty {
+            syn::Type::Array(array) => crate::rust_indices::evaluate(&array.len, &|_| {
+                crate::rust_indices::IndexValue::Unknown
+            })
+            .constant(),
+            syn::Type::Path(path)
+                if path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "Box") =>
+            {
+                let syn::PathArguments::AngleBracketed(arguments) =
+                    &path.path.segments.last()?.arguments
+                else {
+                    return None;
+                };
+                arguments.args.iter().find_map(|argument| match argument {
+                    syn::GenericArgument::Type(ty) => array_length(ty),
+                    _ => None,
+                })
+            }
+            _ => None,
+        }
+    }
+    let length = syn::parse_str::<syn::Type>(&field.ty_str)
+        .ok()
+        .as_ref()
+        .and_then(array_length);
+    if length.is_some_and(|length| length < 2) {
+        return None;
+    }
+    let mut indices = HashSet::new();
+    let mut written_indices = HashSet::new();
+    let mut dynamic = false;
+    let mut has_element_write = false;
+    for item in evidence.into_iter().flat_map(|set| &set.evidence) {
+        if item.field_name.as_deref() != Some(&field.name)
+            || item.access_kind.is_none()
+            || (item.access_mode.is_exclusive()
+                && !item.in_concurrent_context
+                && !item.through_shared_indirection
+                && !item.through_raw_pointer)
+        {
+            continue;
+        }
+        for context in &item.semantic_contexts {
+            let Some(index) = context.strip_prefix("container_element_index:") else {
+                continue;
+            };
+            if index == "dynamic" {
+                dynamic = true;
+            } else if let Ok(index) = index.parse::<usize>() {
+                if length.is_some_and(|length| index >= length) {
+                    continue;
+                }
+                indices.insert(index);
+                if matches!(
+                    item.access_kind,
+                    Some(AtomicAccessKind::Write | AtomicAccessKind::ReadModifyWrite)
+                ) {
+                    written_indices.insert(index);
+                }
+            } else {
+                continue;
+            }
+            has_element_write |= matches!(
+                item.access_kind,
+                Some(AtomicAccessKind::Write | AtomicAccessKind::ReadModifyWrite)
+            );
+        }
+    }
+    if !has_element_write {
+        return None;
+    }
+    if dynamic {
+        return Some(vec![
+            format!("{}[i]", field.name),
+            format!("{}[j]", field.name),
+        ]);
+    }
+    let mut indices: Vec<_> = indices.into_iter().collect();
+    indices.sort_unstable();
+    let stride = contiguous_element_spelling(&field.ty_str)
+        .and_then(|element| crate::struct_layout::estimate_type_size(&element));
+    indices.windows(2).find_map(|pair| {
+        if !pair.iter().any(|index| written_indices.contains(index)) {
+            return None;
+        }
+        if stride.is_some_and(|stride| {
+            pair[1]
+                .saturating_sub(pair[0])
+                .saturating_sub(1)
+                .saturating_mul(stride)
+                .saturating_add(1)
+                >= si.cache_line_size
+        }) {
+            return None;
+        }
+        Some(vec![
+            format!("{}[{}]", field.name, pair[0]),
+            format!("{}[{}]", field.name, pair[1]),
+        ])
+    })
 }
 
 fn assess_container_risk(

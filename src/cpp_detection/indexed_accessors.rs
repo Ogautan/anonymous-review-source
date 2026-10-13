@@ -3,6 +3,7 @@
 //! bounded to one return and one pointer parameter; unresolved bindings add no
 //! positive mutation/contiguity evidence.
 use super::*;
+use crate::cpp_detection::parser::CodeChildren;
 use tree_sitter::Node;
 
 type Key = (String, Option<usize>);
@@ -25,7 +26,7 @@ pub(super) struct Summaries {
 
 fn unwrap(mut node: Node<'_>) -> Node<'_> {
     while node.kind() == "parenthesized_expression" {
-        let Some(inner) = node.named_child(0) else {
+        let Some(inner) = node.named_code_child(0) else {
             break;
         };
         node = inner;
@@ -154,7 +155,7 @@ impl Summaries {
                 return;
             }
             for (position, target) in args
-                .named_children(&mut args.walk())
+                .named_code_children(&mut args.walk())
                 .filter(|arg| arg.kind() != "comment")
                 .enumerate()
             {
@@ -266,13 +267,13 @@ fn summarize(
     {
         return None;
     }
-    let declarator = outer.named_child(0)?;
+    let declarator = outer.named_code_child(0)?;
     if declarator.kind() != "function_declarator" {
         return None;
     }
     let params = declarator.child_by_field_name("parameters")?;
     let params = params
-        .named_children(&mut params.walk())
+        .named_code_children(&mut params.walk())
         .filter(|parameter| parameter.kind() != "comment")
         .collect::<Vec<_>>();
     let mut names = Vec::new();
@@ -299,7 +300,7 @@ fn summarize(
         return None;
     };
     let statements = body
-        .named_children(&mut body.walk())
+        .named_code_children(&mut body.walk())
         .filter(|n| n.kind() != "comment")
         .collect::<Vec<_>>();
     let [statement] = statements.as_slice() else {
@@ -308,7 +309,7 @@ fn summarize(
     if statement.kind() != "return_statement" {
         return None;
     }
-    let mut returned = unwrap(statement.named_child(0)?);
+    let mut returned = unwrap(statement.named_code_child(0)?);
     if pointer_return {
         if returned.kind() != "pointer_expression"
             || node_text(returned.child_by_field_name("operator")?, &file.source) != "&"
@@ -323,10 +324,10 @@ fn summarize(
         return None;
     }
     let indices = returned.child_by_field_name("indices")?;
-    if indices.named_child_count() != 1 {
+    if indices.named_code_child_count() != 1 {
         return None;
     }
-    let expression = indices.named_child(0)?;
+    let expression = indices.named_code_child(0)?;
     let text = node_text(expression, &file.source);
     let selected = names
         .iter()

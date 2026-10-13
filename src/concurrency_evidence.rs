@@ -11,6 +11,7 @@ use syn::{
 
 use crate::dataflow::LoopAnalyzer;
 use crate::helpers::normalize_type_name;
+use crate::rust_indices::{self, IndexValue};
 use crate::types::{
     AccessMode, AtomicAccessKind, ConcurrencyEvidenceSet, EvidenceItem, EvidenceKind, ParsedFile,
     StructInfo, StructKey,
@@ -172,6 +173,7 @@ pub fn collect_concurrency_evidence_with_stats(
             current_receiver_mode: None,
             async_context_depth: 0,
             unsafe_context_depth: 0,
+            index_control_depth: 0,
             evidence_map: &mut evidence_map,
             function_summaries: &mut function_summaries,
             call_sites: &mut call_sites,
@@ -182,6 +184,7 @@ pub fn collect_concurrency_evidence_with_stats(
             imports: &semantic_declarations.imports,
             scoped_vars: vec![HashMap::new()],
             scoped_symbolic_vars: vec![HashSet::new()],
+            scoped_indices: vec![HashMap::new()],
         };
         collector.visit_file(&pf.ast);
 
@@ -229,6 +232,7 @@ struct EvidenceCollector<'a> {
     current_receiver_mode: Option<AccessMode>,
     async_context_depth: usize,
     unsafe_context_depth: usize,
+    index_control_depth: usize,
     evidence_map: &'a mut HashMap<StructKey, ConcurrencyEvidenceSet>,
     function_summaries: &'a mut HashMap<FunctionKey, FunctionSummary>,
     call_sites: &'a mut Vec<FunctionCallSite>,
@@ -239,6 +243,13 @@ struct EvidenceCollector<'a> {
     imports: &'a ModuleImports,
     scoped_vars: Vec<HashMap<String, VarBinding>>,
     scoped_symbolic_vars: Vec<HashSet<String>>,
+    scoped_indices: Vec<HashMap<String, IndexBinding>>,
+}
+
+#[derive(Clone, Copy)]
+struct IndexBinding {
+    value: IndexValue,
+    mutable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,6 +275,7 @@ struct ResolvedAccess {
     field_name: String,
     access_path: String,
     is_indexed: bool,
+    element_index: Option<IndexValue>,
     access_mode: AccessMode,
     through_shared_indirection: bool,
     through_raw_pointer: bool,
@@ -554,12 +566,14 @@ impl<'a> EvidenceCollector<'a> {
     fn enter_scope(&mut self) {
         self.scoped_vars.push(HashMap::new());
         self.scoped_symbolic_vars.push(HashSet::new());
+        self.scoped_indices.push(HashMap::new());
     }
 
     fn leave_scope(&mut self) {
         if self.scoped_vars.len() > 1 {
             self.scoped_vars.pop();
             self.scoped_symbolic_vars.pop();
+            self.scoped_indices.pop();
         }
     }
 
@@ -574,6 +588,200 @@ impl<'a> EvidenceCollector<'a> {
             .iter()
             .rev()
             .find_map(|scope| scope.get(name).cloned())
+    }
+
+    fn index_value(&self, expression: &Expr) -> IndexValue {
+        rust_indices::evaluate(expression, &|name| {
+            self.scoped_indices
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(name).map(|binding| binding.value))
+                .unwrap_or(IndexValue::Unknown)
+        })
+    }
+
+    fn bind_index_pattern(&mut self, pattern: &Pat, value: IndexValue) {
+        struct Bindings(Vec<(String, bool)>);
+        impl<'ast> Visit<'ast> for Bindings {
+            fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+                self.0
+                    .push((pattern.ident.to_string(), pattern.mutability.is_some()));
+                syn::visit::visit_pat_ident(self, pattern);
+            }
+        }
+        let mut names = Bindings(Vec::new());
+        names.visit_pat(pattern);
+        if let Some(scope) = self.scoped_indices.last_mut() {
+            for (name, mutable) in names.0 {
+                scope.insert(name, IndexBinding { value, mutable });
+            }
+        }
+    }
+
+    fn assign_index(&mut self, target: &Expr, value: IndexValue) {
+        let Some(name) = index_local_name(target) else {
+            return;
+        };
+        for scope in self.scoped_indices.iter_mut().rev() {
+            if let Some(binding) = scope.get_mut(&name) {
+                binding.value = if self.index_control_depth > 0 {
+                    binding.value.join(value)
+                } else {
+                    value
+                };
+                return;
+            }
+        }
+    }
+
+    fn invalidate_index_receiver(&mut self, receiver: &Expr) {
+        let Some(name) = index_local_name(receiver) else {
+            return;
+        };
+        self.invalidate_mutable_index(&name);
+    }
+
+    fn invalidate_mutable_index(&mut self, name: &str) {
+        for scope in self.scoped_indices.iter_mut().rev() {
+            if let Some(binding) = scope.get_mut(name) {
+                // Unresolved method/macro effects may change mutable integers.
+                // Never upgrade an unknown binding to a known numeric fact.
+                if binding.mutable && binding.value != IndexValue::Unknown {
+                    binding.value = IndexValue::Integer;
+                }
+                return;
+            }
+        }
+    }
+
+    fn invalidate_loop_indices(&mut self, body: &syn::Block) {
+        #[derive(Default)]
+        struct Assignments(Vec<(String, bool)>);
+        impl<'ast> Visit<'ast> for Assignments {
+            fn visit_expr_assign(&mut self, expression: &'ast syn::ExprAssign) {
+                if let Some(name) = index_local_name(&expression.left) {
+                    self.0.push((name, false));
+                }
+                syn::visit::visit_expr_assign(self, expression);
+            }
+            fn visit_expr_binary(&mut self, expression: &'ast syn::ExprBinary) {
+                if is_compound_assign(&expression.op)
+                    && let Some(name) = index_local_name(&expression.left)
+                {
+                    self.0.push((name, false));
+                }
+                syn::visit::visit_expr_binary(self, expression);
+            }
+            fn visit_expr_reference(&mut self, expression: &'ast syn::ExprReference) {
+                if expression.mutability.is_some()
+                    && let Some(name) = index_local_name(&expression.expr)
+                {
+                    self.0.push((name, false));
+                }
+                syn::visit::visit_expr_reference(self, expression);
+            }
+            fn visit_expr_method_call(&mut self, expression: &'ast ExprMethodCall) {
+                if let Some(name) = index_local_name(&expression.receiver) {
+                    self.0.push((name, true));
+                }
+                syn::visit::visit_expr_method_call(self, expression);
+            }
+            fn visit_expr_raw_addr(&mut self, expression: &'ast syn::ExprRawAddr) {
+                if matches!(expression.mutability, syn::PointerMutability::Mut(_))
+                    && let Some(name) = index_local_name(&expression.expr)
+                {
+                    self.0.push((name, false));
+                }
+                syn::visit::visit_expr_raw_addr(self, expression);
+            }
+            fn visit_expr_macro(&mut self, expression: &'ast syn::ExprMacro) {
+                self.0.extend(
+                    token_identifiers(&expression.mac.tokens)
+                        .into_iter()
+                        .map(|name| (name, true)),
+                );
+            }
+            fn visit_stmt_macro(&mut self, statement: &'ast syn::StmtMacro) {
+                self.0.extend(
+                    token_identifiers(&statement.mac.tokens)
+                        .into_iter()
+                        .map(|name| (name, true)),
+                );
+            }
+        }
+        let mut assignments = Assignments::default();
+        assignments.visit_block(body);
+        for (name, requires_mutable) in assignments.0 {
+            for scope in self.scoped_indices.iter_mut().rev() {
+                if let Some(binding) = scope.get_mut(&name) {
+                    if binding.value != IndexValue::Unknown
+                        && (!requires_mutable || binding.mutable)
+                    {
+                        binding.value = IndexValue::Integer;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn element_index(&self, expression: &Expr, field: &str) -> Option<IndexValue> {
+        fn selects_field(expression: &Expr, name: &str) -> bool {
+            match expression {
+                Expr::Field(expr) => expr.member.to_token_stream().to_string() == name,
+                Expr::Reference(expr) => selects_field(&expr.expr, name),
+                Expr::Paren(expr) => selects_field(&expr.expr, name),
+                Expr::Group(expr) => selects_field(&expr.expr, name),
+                _ => false,
+            }
+        }
+        match expression {
+            Expr::MethodCall(expr) if self.is_native_element_accessor(expr) => {
+                let access = self.resolve_access(&expr.receiver)?;
+                let index = self.index_value(&expr.args[0]);
+                (access.field_name == field && index != IndexValue::Unknown).then_some(index)
+            }
+            Expr::MethodCall(expr) if self.is_element_option_projection(expr) => {
+                self.element_index(&expr.receiver, field)
+            }
+            Expr::Index(expr) if selects_field(&expr.expr, field) => {
+                Some(self.index_value(&expr.index))
+            }
+            Expr::Index(expr) => self.element_index(&expr.expr, field),
+            Expr::Field(expr) => self.element_index(&expr.base, field),
+            Expr::Reference(expr) => self.element_index(&expr.expr, field),
+            Expr::Unary(expr) => self.element_index(&expr.expr, field),
+            Expr::Paren(expr) => self.element_index(&expr.expr, field),
+            Expr::Group(expr) => self.element_index(&expr.expr, field),
+            Expr::Cast(expr) => self.element_index(&expr.expr, field),
+            _ => None,
+        }
+    }
+
+    fn is_native_element_accessor(&self, expression: &ExprMethodCall) -> bool {
+        matches!(
+            expression.method.to_string().as_str(),
+            "get" | "get_mut" | "get_unchecked" | "get_unchecked_mut"
+        ) && expression.args.len() == 1
+            && self
+                .resolve_access(&expression.receiver)
+                .is_some_and(|access| {
+                    self.field_type_tokens(&access.struct_name, &access.field_name)
+                        .and_then(|ty| syn::parse_str::<syn::Type>(ty).ok())
+                        .is_some_and(|ty| is_native_sequence_type(&ty))
+                })
+    }
+
+    fn is_element_option_projection(&self, expression: &ExprMethodCall) -> bool {
+        let arguments_match = match expression.method.to_string().as_str() {
+            "unwrap" => expression.args.is_empty(),
+            "expect" => expression.args.len() == 1,
+            _ => false,
+        };
+        arguments_match
+            && matches!(expression.receiver.as_ref(), Expr::MethodCall(receiver)
+                if matches!(receiver.method.to_string().as_str(), "get" | "get_mut")
+                    && self.is_native_element_accessor(receiver))
     }
 
     fn bind_symbolic_pattern(&mut self, pattern: &Pat) {
@@ -965,8 +1173,11 @@ impl<'a> EvidenceCollector<'a> {
             let loop_ctx = self.loop_analyzer.current_loop_context();
             let mut contexts = access_semantic_contexts(&access);
             contexts.push("macro_expansion_summary".to_string());
-            if summary.index_argument.is_some() {
-                contexts.push("symbolic_index".to_string());
+            if let Some(index) = summary
+                .index_argument
+                .and_then(|index| arguments.get(index))
+            {
+                contexts.push(self.index_value(index).context());
             }
             let index = summary
                 .index_argument
@@ -1116,6 +1327,7 @@ impl<'a> EvidenceCollector<'a> {
                     field_name: segment.clone(),
                     access_path: current_path,
                     is_indexed: indexed,
+                    element_index: self.element_index(expr, segment),
                     access_mode,
                     through_shared_indirection,
                     through_raw_pointer,
@@ -1143,6 +1355,7 @@ impl<'a> EvidenceCollector<'a> {
                     field_name: segment.clone(),
                     access_path: current_path,
                     is_indexed: indexed,
+                    element_index: self.element_index(expr, segment),
                     access_mode,
                     through_shared_indirection,
                     through_raw_pointer,
@@ -1183,6 +1396,13 @@ impl<'a> EvidenceCollector<'a> {
                 *indexed = true;
                 self.collect_access_path(&index.expr, segments, indexed)
             }
+            Expr::MethodCall(method) if self.is_native_element_accessor(method) => {
+                *indexed = true;
+                self.collect_access_path(&method.receiver, segments, indexed)
+            }
+            Expr::MethodCall(method) if self.is_element_option_projection(method) => {
+                self.collect_access_path(&method.receiver, segments, indexed)
+            }
             Expr::Path(path) => {
                 let name = path.path.segments.last()?.ident.to_string();
                 if name == "self" || name == "Self" {
@@ -1222,6 +1442,7 @@ impl<'a> EvidenceCollector<'a> {
             }
             Expr::Unary(unary) => self.collect_access_path(&unary.expr, segments, indexed),
             Expr::Paren(paren) => self.collect_access_path(&paren.expr, segments, indexed),
+            Expr::Group(group) => self.collect_access_path(&group.expr, segments, indexed),
             Expr::Cast(cast) => self.collect_access_path(&cast.expr, segments, indexed),
             _ => None,
         }
@@ -1533,6 +1754,7 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
                     self.current_receiver_mode = Some(access_mode_from_receiver(receiver));
                 }
                 syn::FnArg::Typed(pat_ty) => {
+                    self.bind_index_pattern(&pat_ty.pat, IndexValue::from_type(&pat_ty.ty));
                     if let Some((name, mut binding)) = self.binding_from_pat_type(pat_ty) {
                         let agent_local = binding.access_mode.is_exclusive();
                         binding.origin = Some(ValueOrigin::Parameter(parameter_index));
@@ -1577,6 +1799,9 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
         self.enter_scope();
         let mut parameter_index = 0;
         for input in &node.sig.inputs {
+            if let syn::FnArg::Typed(pat_ty) = input {
+                self.bind_index_pattern(&pat_ty.pat, IndexValue::from_type(&pat_ty.ty));
+            }
             if let syn::FnArg::Typed(pat_ty) = input
                 && let Some((name, mut binding)) = self.binding_from_pat_type(pat_ty)
             {
@@ -1614,6 +1839,11 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
     fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
         self.enter_scope();
         for input in &node.inputs {
+            let value = match input {
+                Pat::Type(pat_ty) => IndexValue::from_type(&pat_ty.ty),
+                _ => IndexValue::Unknown,
+            };
+            self.bind_index_pattern(input, value);
             if let Pat::Type(pat_ty) = input
                 && let Some((name, binding)) = self.binding_from_pat_type(pat_ty)
             {
@@ -1638,11 +1868,20 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
         if let Some(init) = &node.init {
             self.record_plain_value_read(&init.expr, self.span_line(&init.expr));
         }
+        let value = node
+            .init
+            .as_ref()
+            .map(|init| self.index_value(&init.expr))
+            .unwrap_or(IndexValue::Unknown);
         self.handle_local_binding(node);
         syn::visit::visit_local(self, node);
+        // A let binding is not in scope in its own initializer.
+        self.bind_index_pattern(&node.pat, value);
     }
 
     fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        self.invalidate_loop_indices(&node.body);
+        self.index_control_depth += 1;
         // Enter loop context
         self.loop_analyzer.current_depth += 1;
         let iter_est = crate::dataflow::LoopAnalyzer::estimate_iterations(&node.expr);
@@ -1655,8 +1894,39 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
 
         self.visit_expr(&node.expr);
         self.enter_scope();
-        self.visit_block(&node.body);
+        let range = match node.expr.as_ref() {
+            Expr::Range(range) => range
+                .start
+                .as_deref()
+                .and_then(|expr| self.index_value(expr).constant())
+                .zip(
+                    range
+                        .end
+                        .as_deref()
+                        .and_then(|expr| self.index_value(expr).constant()),
+                )
+                .map(|(start, end)| {
+                    (
+                        start,
+                        end.saturating_sub(start).saturating_add(usize::from(
+                            matches!(range.limits, syn::RangeLimits::Closed(_)) && end >= start,
+                        )),
+                    )
+                }),
+            _ => None,
+        };
+        self.bind_index_pattern(
+            &node.pat,
+            match range {
+                Some((start, 1)) => IndexValue::Constant(start),
+                _ => IndexValue::Integer,
+            },
+        );
+        if range.is_none_or(|(_, length)| length != 0) {
+            self.visit_block(&node.body);
+        }
         self.leave_scope();
+        self.index_control_depth -= 1;
 
         // Exit loop context
         self.loop_analyzer.loop_stack.pop();
@@ -1664,6 +1934,8 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
     }
 
     fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        self.invalidate_loop_indices(&node.body);
+        self.index_control_depth += 1;
         self.loop_analyzer.current_depth += 1;
         self.loop_analyzer
             .loop_stack
@@ -1672,23 +1944,19 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
                 iteration_estimate: crate::types::IterationEstimate::Dynamic,
             });
 
-        if let Expr::Let(expr_let) = node.cond.as_ref() {
-            self.visit_expr(&expr_let.expr);
-            self.enter_scope();
-            if let Some(binding) = self.binding_from_expr(&expr_let.expr) {
-                self.bind_pattern_from_binding(&expr_let.pat, &binding);
-            }
-            self.visit_block(&node.body);
-            self.leave_scope();
-        } else {
-            syn::visit::visit_expr_while(self, node);
-        }
+        self.enter_scope();
+        self.visit_expr(&node.cond);
+        self.visit_block(&node.body);
+        self.leave_scope();
+        self.index_control_depth -= 1;
 
         self.loop_analyzer.loop_stack.pop();
         self.loop_analyzer.current_depth = self.loop_analyzer.current_depth.saturating_sub(1);
     }
 
     fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
+        self.invalidate_loop_indices(&node.body);
+        self.index_control_depth += 1;
         self.loop_analyzer.current_depth += 1;
         self.loop_analyzer
             .loop_stack
@@ -1698,29 +1966,21 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
             });
 
         syn::visit::visit_expr_loop(self, node);
+        self.index_control_depth -= 1;
 
         self.loop_analyzer.loop_stack.pop();
         self.loop_analyzer.current_depth = self.loop_analyzer.current_depth.saturating_sub(1);
     }
 
     fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        self.index_control_depth += 1;
         let line = self.span_line(node);
         let symbolic_partition = match node.cond.as_ref() {
             Expr::Let(expr_let) => self.expression_depends_on_symbolic(&expr_let.expr),
             condition => self.expression_depends_on_symbolic(condition),
         };
-        if let Expr::Let(expr_let) = node.cond.as_ref() {
-            self.visit_expr(&expr_let.expr);
-            self.enter_scope();
-            if let Some(binding) = self.binding_from_expr(&expr_let.expr) {
-                self.bind_pattern_from_binding(&expr_let.pat, &binding);
-            } else if symbolic_partition {
-                self.bind_symbolic_pattern(&expr_let.pat);
-            }
-        } else {
-            self.visit_expr(&node.cond);
-            self.enter_scope();
-        }
+        self.enter_scope();
+        self.visit_expr(&node.cond);
         if symbolic_partition {
             self.current_semantic_contexts
                 .push(format!("control_partition:then:{}:{line}", self.file));
@@ -1740,14 +2000,30 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
                 self.current_semantic_contexts.pop();
             }
         }
+        self.index_control_depth -= 1;
+    }
+
+    fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
+        // Conditions (including let chains) bind their patterns only after
+        // evaluating the scrutinee. The enclosing if/while owns this scope.
+        let symbolic = self.expression_depends_on_symbolic(&node.expr);
+        self.visit_expr(&node.expr);
+        self.bind_index_pattern(&node.pat, IndexValue::Unknown);
+        if let Some(binding) = self.binding_from_expr(&node.expr) {
+            self.bind_pattern_from_binding(&node.pat, &binding);
+        } else if symbolic {
+            self.bind_symbolic_pattern(&node.pat);
+        }
     }
 
     fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+        self.index_control_depth += 1;
         let symbolic_partition = self.expression_depends_on_symbolic(&node.expr);
         self.visit_expr(&node.expr);
         let binding = self.binding_from_expr(&node.expr);
         for (index, arm) in node.arms.iter().enumerate() {
             self.enter_scope();
+            self.bind_index_pattern(&arm.pat, IndexValue::Unknown);
             if let Some(binding) = &binding {
                 self.bind_pattern_from_binding(&arm.pat, binding);
             } else if symbolic_partition {
@@ -1769,9 +2045,11 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
             }
             self.leave_scope();
         }
+        self.index_control_depth -= 1;
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        self.invalidate_index_receiver(&node.receiver);
         self.check_sync_method_on_field(node);
         self.record_method_call_site(node);
 
@@ -1825,8 +2103,20 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
     }
 
     fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+        // Macro input tokens are not ordinary visited expressions. A mutable
+        // identifier may be assigned or have its address taken by expansion.
+        for name in token_identifiers(&node.mac.tokens) {
+            self.invalidate_mutable_index(&name);
+        }
         self.record_macro_expansion_access(node);
         syn::visit::visit_expr_macro(self, node);
+    }
+
+    fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+        for name in token_identifiers(&node.mac.tokens) {
+            self.invalidate_mutable_index(&name);
+        }
+        syn::visit::visit_stmt_macro(self, node);
     }
 
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
@@ -1872,6 +2162,21 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
         syn::visit::visit_expr_call(self, node);
     }
 
+    fn visit_expr_reference(&mut self, node: &'ast syn::ExprReference) {
+        if node.mutability.is_some() {
+            // The borrow can escape through either a call or a local alias.
+            self.assign_index(&node.expr, IndexValue::Integer);
+        }
+        syn::visit::visit_expr_reference(self, node);
+    }
+
+    fn visit_expr_raw_addr(&mut self, node: &'ast syn::ExprRawAddr) {
+        if matches!(node.mutability, syn::PointerMutability::Mut(_)) {
+            self.assign_index(&node.expr, IndexValue::Integer);
+        }
+        syn::visit::visit_expr_raw_addr(self, node);
+    }
+
     fn visit_expr_field(&mut self, node: &'ast ExprField) {
         if self.in_concurrent_context {
             self.record_concurrent_field_access(&Expr::Field(node.clone()), self.span_line(node));
@@ -1889,6 +2194,7 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
     fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
         let line = self.span_line(node);
         self.record_plain_field_write(&node.left, line);
+        self.assign_index(&node.left, self.index_value(&node.right));
         syn::visit::visit_expr_assign(self, node);
     }
 
@@ -1896,6 +2202,7 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
         if is_compound_assign(&node.op) {
             let line = self.span_line(node);
             self.record_compound_field_write(&node.left, line);
+            self.assign_index(&node.left, IndexValue::Integer);
         } else {
             self.record_plain_value_read(&node.left, self.span_line(&node.left));
             self.record_plain_value_read(&node.right, self.span_line(&node.right));
@@ -1998,6 +2305,9 @@ fn looks_like_type_or_trait_name(name: &str) -> bool {
 
 fn access_semantic_contexts(access: &ResolvedAccess) -> Vec<String> {
     let mut contexts = Vec::new();
+    if let Some(index) = access.element_index {
+        contexts.push(index.context());
+    }
     if access.through_shared_indirection {
         contexts.push("shared_indirection".to_string());
     }
@@ -2014,33 +2324,36 @@ fn access_semantic_contexts(access: &ResolvedAccess) -> Vec<String> {
 }
 
 fn collect_pattern_identifiers(pattern: &Pat, output: &mut Vec<String>) {
-    match pattern {
-        Pat::Ident(ident) => output.push(ident.ident.to_string()),
-        Pat::Reference(reference) => collect_pattern_identifiers(&reference.pat, output),
-        Pat::Type(typed) => collect_pattern_identifiers(&typed.pat, output),
-        Pat::Tuple(tuple) => {
-            for element in &tuple.elems {
-                collect_pattern_identifiers(element, output);
-            }
+    struct Identifiers<'a>(&'a mut Vec<String>);
+    impl<'ast> Visit<'ast> for Identifiers<'_> {
+        fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
+            self.0.push(node.ident.to_string());
+            syn::visit::visit_pat_ident(self, node);
         }
-        Pat::TupleStruct(tuple) => {
-            for element in &tuple.elems {
-                collect_pattern_identifiers(element, output);
-            }
-        }
-        Pat::Struct(record) => {
-            for field in &record.fields {
-                collect_pattern_identifiers(&field.pat, output);
-            }
-        }
-        Pat::Slice(slice) => {
-            for element in &slice.elems {
-                collect_pattern_identifiers(element, output);
-            }
-        }
-        Pat::Paren(paren) => collect_pattern_identifiers(&paren.pat, output),
-        _ => {}
     }
+    Identifiers(output).visit_pat(pattern);
+}
+
+fn index_local_name(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Path(path) => path.path.get_ident().map(ToString::to_string),
+        Expr::Paren(expr) => index_local_name(&expr.expr),
+        Expr::Group(expr) => index_local_name(&expr.expr),
+        _ => None,
+    }
+}
+
+fn token_identifiers(tokens: &proc_macro2::TokenStream) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    let mut pending: Vec<_> = tokens.clone().into_iter().collect();
+    while let Some(token) = pending.pop() {
+        match token {
+            proc_macro2::TokenTree::Ident(name) => identifiers.push(name.to_string()),
+            proc_macro2::TokenTree::Group(group) => pending.extend(group.stream()),
+            _ => {}
+        }
+    }
+    identifiers
 }
 
 fn type_can_partition_agents(ty: &str) -> bool {
@@ -3014,6 +3327,28 @@ fn is_transparent_binding_wrapper(name: &str) -> bool {
 fn top_level_wrapper_name(ty: &str) -> Option<String> {
     let parsed = syn::parse_str::<syn::Type>(ty).ok()?;
     top_level_wrapper_from_syn(&parsed)
+}
+
+/// Recover native slice indexing through owned/shared sequence wrappers.
+/// A project-defined getter is not necessarily an element projection.
+fn is_native_sequence_type(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Array(_) | syn::Type::Slice(_) => true,
+        syn::Type::Reference(reference) => is_native_sequence_type(&reference.elem),
+        syn::Type::Paren(paren) => is_native_sequence_type(&paren.elem),
+        syn::Type::Group(group) => is_native_sequence_type(&group.elem),
+        syn::Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+            if segment.ident == "Vec" {
+                return true;
+            }
+            matches!(segment.ident.to_string().as_str(), "Box" | "Arc" | "Rc")
+                && matches!(&segment.arguments, syn::PathArguments::AngleBracketed(arguments)
+                    if arguments.args.iter().any(|argument|
+                        matches!(argument, syn::GenericArgument::Type(inner)
+                            if is_native_sequence_type(inner))))
+        }),
+        _ => false,
+    }
 }
 
 fn top_level_wrapper_from_syn(ty: &syn::Type) -> Option<String> {

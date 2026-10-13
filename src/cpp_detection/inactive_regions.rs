@@ -1,5 +1,6 @@
 //! Exclude proved inactive literal preprocessor branches from both AST and
 //! text evidence. This is deliberately not a macro/configuration preprocessor.
+use crate::cpp_detection::parser::CodeChildren;
 
 use std::ops::Range;
 
@@ -7,7 +8,7 @@ use tree_sitter::{Node, Tree};
 
 use super::{node_text, walk_nodes};
 
-pub(super) fn mask_literal_inactive_branches(source: &str, tree: &Tree) -> Option<String> {
+pub(super) fn literal_inactive_ranges(source: &str, tree: &Tree) -> Vec<Range<usize>> {
     let mut ranges = Vec::<Range<usize>>::new();
     walk_nodes(tree.root_node(), &mut |root| {
         if !matches!(root.kind(), "preproc_if" | "preproc_ifdef") || root.has_error() {
@@ -15,7 +16,7 @@ pub(super) fn mask_literal_inactive_branches(source: &str, tree: &Tree) -> Optio
         }
         // Recovery can swallow an #else/#endif and unrelated following code.
         // A missing closing token is not a safe deletion boundary.
-        let Some(end) = root.children(&mut root.walk()).find(|child| {
+        let Some(end) = root.code_children(&mut root.walk()).find(|child| {
             child.kind() == "#endif" && !child.is_missing() && node_text(*child, source) == "#endif"
         }) else {
             return;
@@ -27,7 +28,7 @@ pub(super) fn mask_literal_inactive_branches(source: &str, tree: &Tree) -> Optio
             let condition = current.child_by_field_name("condition");
             let truth = condition.and_then(|condition| literal_truth(condition, source));
             let begin = if current.kind() == "preproc_else" {
-                current.child(0).map(|token| token.end_byte())
+                current.code_child(0).map(|token| token.end_byte())
             } else {
                 condition
                     .map(|condition| condition.end_byte())
@@ -53,9 +54,6 @@ pub(super) fn mask_literal_inactive_branches(source: &str, tree: &Tree) -> Optio
             branch = next;
         }
     });
-    if ranges.is_empty() {
-        return None;
-    }
     ranges.sort_unstable_by_key(|range| (range.start, range.end));
     let mut merged = Vec::<Range<usize>>::new();
     for range in ranges {
@@ -67,18 +65,7 @@ pub(super) fn mask_literal_inactive_branches(source: &str, tree: &Tree) -> Optio
             merged.push(range);
         }
     }
-    let mut masked = source.as_bytes().to_vec();
-    let mut changed = false;
-    for range in merged {
-        for byte in &mut masked[range] {
-            if !matches!(*byte, b'\n' | b'\r' | b' ' | b'\t') {
-                *byte = b' ';
-                changed = true;
-            }
-        }
-    }
-    changed
-        .then(|| String::from_utf8(masked).expect("whole inactive byte regions replaced by ASCII"))
+    merged
 }
 
 fn literal_truth(mut node: Node<'_>, source: &str) -> Option<bool> {
@@ -86,7 +73,7 @@ fn literal_truth(mut node: Node<'_>, source: &str) -> Option<bool> {
         return None;
     }
     while node.kind() == "parenthesized_expression" {
-        node = node.named_child(0)?;
+        node = node.named_code_child(0)?;
     }
     if node.kind() != "number_literal" {
         return None;

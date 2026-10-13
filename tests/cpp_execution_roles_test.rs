@@ -14,6 +14,58 @@ fn analyze(source: &str, cache_line_size: usize, speculative: bool) -> Report {
 }
 
 #[test]
+fn named_thread_entries_do_not_depend_on_declaration_line_breaks() {
+    for threads in [
+        "\n std::thread a(one,s);\n std::thread b(two,s);\n",
+        "std::thread a(one,s); std::thread b(two,s);",
+        "std::thread a(one,s), b(two,s);",
+        "std::thread a{one,s}; std::thread b{two,s};",
+        "std::thread a(\n one,s\n); std::thread b(\n two,s\n);",
+        "std::thread a(/* entry */ one, /* receiver */ s); std::thread b(/* entry */ two, s);",
+        "std::thread a{ /* entry */ one, s }; std::thread b{ /* entry */ two, s };",
+    ] {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("entries.cpp"), format!(
+            "#include <atomic>\n#include <thread>\nstruct State {{ std::atomic<int> first; std::atomic<int> second; }};\nvoid one(State *s) {{ s->first.fetch_add(1); }}\nvoid two(State *s) {{ s->second.fetch_add(1); }}\nvoid run(State *s) {{ {threads} a.join(); b.join(); }}"
+        )).unwrap();
+        for cache_line_size in [32, 64, 128] {
+            let report = analyze_cpp_path_with_options(
+                root.path(),
+                &AnalysisOptions {
+                    cache_line_size,
+                    ..AnalysisOptions::with_rules(&[RuleId::SameObjectFields])
+                },
+            );
+            assert!(!report.analysis_incomplete, "{report:#?}");
+            assert!(!report.findings.is_empty(), "{threads}: {report:#?}");
+            let finding = &report.findings[0];
+            for field in ["first", "second"] {
+                assert!(
+                    finding
+                        .access_evidence
+                        .iter()
+                        .any(|access| access.field_name.as_deref() == Some(field)
+                            && access.in_concurrent_context)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn thread_spelling_in_a_string_does_not_make_named_functions_concurrent() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("entries.cpp"),
+        "#include <atomic>\nstruct State { std::atomic<int> first; std::atomic<int> second; };\nvoid one(State *s) { s->first.fetch_add(1); }\nvoid two(State *s) { s->second.fetch_add(1); }\nvoid run() { const char *message = \"std::thread worker(one)\"; }"
+    ).unwrap();
+    let report = analyze_cpp_path_with_options(
+        root.path(),
+        &AnalysisOptions::with_rules(&[RuleId::SameObjectFields]),
+    );
+    assert!(report.findings.is_empty(), "{report:#?}");
+}
+
+#[test]
 fn private_scalar_leaf_preserves_entry_lock_across_builtin_operations() {
     for size in [32, 64, 128] {
         for (body, protected) in [

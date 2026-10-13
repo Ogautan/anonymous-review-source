@@ -29,6 +29,49 @@ fn analyze(source: &str, rule: CandidateKind) -> false_sharing_detector::types::
 }
 
 #[test]
+fn separate_container_fields_keep_separate_storage_pair_groups() {
+    let report = analyze(
+        "struct Metrics {\n std::vector<std::atomic<int>> counters;\n std::vector<std::atomic<int>> slots;\n void update(unsigned worker_id) {\n counters[worker_id].fetch_add(1);\n slots[worker_id].fetch_add(1);\n }\n};",
+        CandidateKind::ContainerElements,
+    );
+    assert!(!report.analysis_incomplete, "{report:#?}");
+    assert_eq!(report.findings.len(), 2, "{report:#?}");
+    assert_ne!(
+        report.findings[0].finding_group_id,
+        report.findings[1].finding_group_id
+    );
+    for finding in report.findings {
+        assert_eq!(finding.field_list.len(), 1, "{finding:#?}");
+        let field = &finding.field_list[0];
+        let pattern = finding.static_pattern.as_ref().unwrap();
+        assert!(
+            pattern
+                .witness_locations
+                .iter()
+                .all(|location| location.starts_with(&format!("{field}["))
+                    || location.contains(&format!(".{field}["))),
+            "{finding:#?}"
+        );
+    }
+}
+
+#[test]
+fn container_and_element_member_paths_share_one_backing_storage_group() {
+    let report = analyze(
+        "struct Entry { std::atomic<int> value; };\nstruct Metrics {\n std::vector<Entry> counters;\n void update(unsigned worker_id) { counters[worker_id].value.fetch_add(1); }\n};",
+        CandidateKind::ContainerElements,
+    );
+    assert!(!report.analysis_incomplete, "{report:#?}");
+    assert_eq!(report.findings.len(), 1, "{report:#?}");
+    assert!(
+        report.findings[0]
+            .field_list
+            .iter()
+            .any(|field| field == "counters[].value")
+    );
+}
+
+#[test]
 fn payload_recurrence_is_not_borrowed_from_vector_header_mutation() {
     for (operation, expected) in [("store(value)", false), ("fetch_add(value)", true)] {
         let source = format!(

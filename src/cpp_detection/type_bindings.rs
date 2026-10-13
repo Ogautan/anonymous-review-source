@@ -1,6 +1,7 @@
 //! Bounded source-level type binding, without treating a project-wide spelling
 //! match as visibility. Only quoted, uniquely resolved project includes enter
 //! the environment; unknown conditional declarations shadow rather than bind.
+use crate::cpp_detection::parser::CodeChildren;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -368,7 +369,7 @@ impl Environment<'_, '_> {
                     && node_text(node, source).trim_start().starts_with("#ifndef")
                     && node.child_by_field_name("name").is_some_and(|name| {
                         let mut cursor = node.walk();
-                        node.named_children(&mut cursor)
+                        node.named_code_children(&mut cursor)
                             .find(|c| c.kind() != "identifier" && c.kind() != "comment")
                             .is_some_and(|first| {
                                 first.kind() == "preproc_def"
@@ -378,7 +379,7 @@ impl Environment<'_, '_> {
                             })
                     });
                 let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
+                for child in node.named_code_children(&mut cursor) {
                     self.visit(child, file, scope, depth, conditional || !guard);
                 }
                 return;
@@ -387,7 +388,7 @@ impl Environment<'_, '_> {
                 // Class templates contribute nominal owners. Alias templates
                 // have dependent substitutions and shadow any outer alias.
                 let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
+                for child in node.named_code_children(&mut cursor) {
                     if matches!(child.kind(), "class_specifier" | "struct_specifier") {
                         self.visit(child, file, scope, depth, conditional);
                     } else if child.kind() == "alias_declaration" {
@@ -405,7 +406,7 @@ impl Environment<'_, '_> {
             _ => return, // Function bodies and sibling local scopes never export types.
         }
         let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
+        for child in node.named_code_children(&mut cursor) {
             self.visit(child, file, scope, depth, conditional);
         }
     }

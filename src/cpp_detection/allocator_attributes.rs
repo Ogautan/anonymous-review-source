@@ -4,6 +4,7 @@ use super::{
     AllocationMacro, FileFacts, callable_name, callable_scope, macro_visibility, node_text,
     normalized_path, unconditionally_preprocessed, walk_nodes,
 };
+use crate::cpp_detection::parser::CodeChildren;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tree_sitter::Node;
@@ -107,11 +108,11 @@ fn nonalias_attribute(node: Node<'_>, source: &str) -> Option<u8> {
             "__attribute" => 2,
             _ => return None,
         };
-        let args = node.named_child(0)?;
+        let args = node.named_code_child(0)?;
         if args.kind() != "argument_list" {
             return None;
         }
-        return args.named_children(&mut args.walk()).find_map(|arg| {
+        return args.named_code_children(&mut args.walk()).find_map(|arg| {
             if arg.kind() != "identifier" {
                 return None;
             }

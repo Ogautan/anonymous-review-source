@@ -1,5 +1,6 @@
 //! Source-declared value parameters: C prototypes and unique C++ static definitions.
 use super::*;
+use crate::cpp_detection::parser::CodeChildren;
 
 pub(in crate::cpp_detection) struct Contract {
     start: usize,
@@ -118,7 +119,7 @@ pub(in crate::cpp_detection) fn collect(file: &ParsedCppFile) -> HashMap<String,
                     break;
                 }
                 let scalar = parameters
-                    .named_children(&mut parameters.walk())
+                    .named_code_children(&mut parameters.walk())
                     .map(|parameter| {
                         parameter.kind() == "parameter_declaration"
                             && parameter.child_by_field_name("type").is_some_and(|ty| {
@@ -181,7 +182,7 @@ pub(in crate::cpp_detection) fn collect(file: &ParsedCppFile) -> HashMap<String,
             continue;
         }
         let scalar = parameters
-            .named_children(&mut parameters.walk())
+            .named_code_children(&mut parameters.walk())
             .map(|parameter| {
                 parameter.kind() == "parameter_declaration"
                     && parameter.child_by_field_name("type").is_some_and(|ty| {
@@ -217,7 +218,7 @@ pub(in crate::cpp_detection) fn declared_c_call(
             call.start_byte() >= contract.start
                 && call
                     .child_by_field_name("arguments")
-                    .is_some_and(|args| args.named_child_count() == contract.scalar.len())
+                    .is_some_and(|args| args.named_code_child_count() == contract.scalar.len())
         })
 }
 
@@ -239,7 +240,8 @@ pub(in crate::cpp_detection) fn consumes_value(
     let Some(contract) = contracts.get(node_text(function, source)) else {
         return false;
     };
-    if call.start_byte() < contract.start || arguments.named_child_count() != contract.scalar.len()
+    if call.start_byte() < contract.start
+        || arguments.named_code_child_count() != contract.scalar.len()
     {
         return false;
     }
@@ -277,11 +279,11 @@ pub(in crate::cpp_detection) fn consumes_value(
         scope = node.parent();
     }
     arguments
-        .named_children(&mut arguments.walk())
+        .named_code_children(&mut arguments.walk())
         .enumerate()
         .any(|(index, mut argument)| {
             while argument.kind() == "parenthesized_expression" {
-                let Some(inner) = argument.named_child(0) else {
+                let Some(inner) = argument.named_code_child(0) else {
                     return false;
                 };
                 argument = inner;

@@ -13,6 +13,8 @@ fn only_proved_inactive_conditional_arms_lose_their_findings() {
         ("$RISK", true),
         ("#if 0\n$RISK#endif\n", false),
         ("#if (0)\n$RISK#endif\n", false),
+        ("#if (/* ignored */ 0)\n$RISK#endif\n", false),
+        ("#if (/* ignored */ 1)\n$RISK#endif\n", true),
         ("#if 1\n$RISK#endif\n", true),
         ("#if UNKNOWN\n$RISK#endif\n", true),
         ("#if 1\n// continued comment \\\n#else\n$RISK#endif\n", true),
@@ -112,7 +114,11 @@ fn comments_and_raw_strings_cannot_open_preprocessor_regions() {
         path: "state.hpp".into(),
         source: source.clone(),
     }]);
-    assert_eq!(files[0].source, source);
+    let code_start = source.find("const char").unwrap();
+    assert_eq!(files[0].source.len(), source.len());
+    assert!(files[0].source[..code_start].trim().is_empty());
+    assert_eq!(files[0].source.find("const char"), Some(code_start));
+    assert_eq!(files[0].source[code_start..], source[code_start..]);
     let records = collect_cpp_structs(&files, "fixture", 64);
     assert!(records.iter().any(|record| record.name == "State"));
 }

@@ -92,6 +92,9 @@ pub struct CppFieldInfo {
     pub ty_str: String,
     pub line: usize,
     pub estimated_size: Option<usize>,
+    /// Alignment of this member's start, separately from its occupied bytes.
+    /// A member attribute does not pad the nominal type or its elements.
+    pub align_bytes: Option<usize>,
     pub offset: Option<usize>,
     pub is_atomic: bool,
     pub is_hot_scalar: bool,

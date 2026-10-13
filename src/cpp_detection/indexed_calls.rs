@@ -1,6 +1,7 @@
 //! Bounded, positional summaries for free functions writing through array
 //! parameters. Neither a parameter's spelling nor a project-wide alias table
 //! identifies the caller's storage. Unsupported bindings remain unresolved.
+use crate::cpp_detection::parser::CodeChildren;
 
 use super::*;
 use tree_sitter::Node;
@@ -42,7 +43,7 @@ fn call_parts<'a>(node: Node<'a>, source: &'a str) -> Option<(&'a str, Vec<Node<
     let mut cursor = args.walk();
     Some((
         node_text(function, source),
-        args.named_children(&mut cursor).collect(),
+        args.named_code_children(&mut cursor).collect(),
     ))
 }
 
@@ -50,7 +51,7 @@ fn parameter_shapes(declarator: Node<'_>, source: &str) -> Option<Vec<String>> {
     let params = declarator.child_by_field_name("parameters")?;
     let mut cursor = params.walk();
     params
-        .named_children(&mut cursor)
+        .named_code_children(&mut cursor)
         .map(|p| {
             let ty = node_text(p.child_by_field_name("type")?, source);
             let shape = match p.child_by_field_name("declarator").map(|d| d.kind()) {
@@ -113,7 +114,7 @@ pub(super) fn collect_bound_indexed_calls(
             let mut pointer_parameters = HashSet::new();
             let mut valid = true;
             let mut cursor = params.walk();
-            for parameter in params.named_children(&mut cursor) {
+            for parameter in params.named_code_children(&mut cursor) {
                 let Some(declaration) = parameter.child_by_field_name("declarator") else {
                     valid = false;
                     break;
@@ -183,14 +184,14 @@ pub(super) fn collect_bound_indexed_calls(
     for (name, function) in &functions {
         // A single expression statement supplies an exact mutation summary,
         // without guessing branch conditions, pointer reassignments or guards.
-        if function.body.named_child_count() != 1 {
+        if function.body.named_code_child_count() != 1 {
             continue;
         }
-        let statement = function.body.named_child(0).unwrap();
+        let statement = function.body.named_code_child(0).unwrap();
         if statement.kind() != "expression_statement" {
             continue;
         }
-        let Some(expression) = statement.named_child(0) else {
+        let Some(expression) = statement.named_code_child(0) else {
             continue;
         };
         let target = match expression.kind() {
@@ -270,13 +271,13 @@ pub(super) fn collect_bound_indexed_calls(
     for _ in 0..3 {
         let previous = summaries.clone();
         for (name, function) in &functions {
-            if previous.contains_key(name) || function.body.named_child_count() != 1 {
+            if previous.contains_key(name) || function.body.named_code_child_count() != 1 {
                 continue;
             }
             let Some(call) = function
                 .body
-                .named_child(0)
-                .and_then(|s| s.named_child(0))
+                .named_code_child(0)
+                .and_then(|s| s.named_code_child(0))
                 .filter(|n| n.kind() == "call_expression")
             else {
                 continue;
