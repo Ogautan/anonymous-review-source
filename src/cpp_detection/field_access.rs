@@ -12,6 +12,8 @@ pub(super) use reference_returns::ReferenceReturns;
 
 #[derive(Clone)]
 pub(super) struct SyntaxAccess {
+    pub object_identity: Option<String>,
+    pub execution_identity: Option<String>,
     /// Another occurrence on this row still needs heuristic recovery. It must
     /// not erase this occurrence's resolved storage/lifetime/access facts.
     pub needs_line_fallback: bool,
@@ -35,6 +37,7 @@ pub(super) struct SyntaxAccess {
 }
 
 struct Binding {
+    value_storage: bool,
     declaration: usize,
     name_byte: usize,
     begin: usize,
@@ -333,6 +336,21 @@ pub(super) fn collect(
                 && owned_value;
             let name_byte = declarator.start_byte() + declarator_text.find(&name).unwrap_or(0);
             bindings.entry(name).or_default().push(Binding {
+                value_storage: owned_value
+                    && !identifier_tokens(declaration).any(|token| {
+                        matches!(
+                            token,
+                            "extern"
+                                | "inline"
+                                | "weak"
+                                | "weakref"
+                                | "alias"
+                                | "common"
+                                | "asm"
+                                | "__asm"
+                                | "__asm__"
+                        )
+                    }),
                 declaration: node.start_byte(),
                 name_byte,
                 begin: if node.kind().contains("parameter") {
@@ -488,6 +506,13 @@ pub(super) fn collect(
             .as_deref()
             .and_then(|name| binding_at(&bindings, name, expression.start_byte()));
         let access = SyntaxAccess {
+            execution_identity: execution_identity(expression, &file.path),
+            object_identity: qualified
+                .and_then(|expression| expression.child_by_field_name("argument"))
+                .filter(|receiver| receiver.kind() == "identifier")
+                .and(receiver_binding)
+                .filter(|binding| binding.value_storage)
+                .map(|binding| format!("value:{}:{}", file.path, binding.name_byte)),
             needs_line_fallback: false,
             record,
             field: field.to_string(),
@@ -592,6 +617,23 @@ fn enclosing_callable(mut node: Node<'_>) -> Option<usize> {
     while let Some(parent) = node.parent() {
         if matches!(parent.kind(), "function_definition" | "lambda_expression") {
             return Some(parent.start_byte());
+        }
+        node = parent;
+    }
+    None
+}
+
+fn execution_identity(mut node: Node<'_>, file: &str) -> Option<String> {
+    let mut branches = Vec::new();
+    while let Some(parent) = node.parent() {
+        if matches!(
+            parent.kind(),
+            "if_statement" | "switch_statement" | "conditional_expression"
+        ) {
+            branches.push(node.start_byte());
+        }
+        if matches!(parent.kind(), "function_definition" | "lambda_expression") {
+            return Some(format!("{file}:{}:{branches:?}", parent.start_byte()));
         }
         node = parent;
     }

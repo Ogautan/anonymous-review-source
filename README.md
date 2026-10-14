@@ -51,6 +51,25 @@ Native Rust sequence accessors retain integer index constraints through
 Continuous-element findings from different container fields keep separate
 storage-pair groups in both frontends.
 
+Same-object field pairs preserve recovered receiver identity. Proven distinct
+value objects and native Rust allocations cannot support that topology;
+unknown aliases, opaque constructors, exposed callees and truncated evidence
+remain conservative. Shared-pointer clones retain pointee identity. C++ uses
+explicit value declarations for these exclusions and leaves pointer/reference
+receivers and cross-translation-unit declarations unresolved.
+Resolved same-object pairs retain their execution roles as well: another
+object's worker cannot complete a coupled pair. Distinct closure/branch roles
+remain distinct, while unknown execution provenance stays conservative.
+Rust pointer-element pointee updates do not supply contiguous slot writes.
+Known non-Sync private container owners cannot establish parallelism solely
+through a shared API. Recognized exclusive guards must cover every selected
+access; released guards, shared read locks and a parent's guard across spawned
+closures do not establish common serialization. Unexpanded macros invalidate
+guard proofs, and opaque handle methods invalidate previous pointee identities.
+Borrowed stack/Box owners can share atomic fields across scoped workers.
+Guard and object reasoning is bounded and is not complete alias or lifetime
+analysis.
+
 ## Source layout
 
 - `src/`: shared pattern model, Rust frontend, C++ frontend, and CLI.

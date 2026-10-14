@@ -549,6 +549,9 @@ fn evidence_rank(item: &CppEvidenceItem) -> u32 {
 #[derive(PartialEq, Eq, Hash)]
 struct EvidenceFieldRole<'a> {
     field: Option<&'a str>,
+    // A container's nested members are distinct locations. Preserve their
+    // diversity before spending the budget on more receiver/execution roles.
+    element_member_path: &'a [String],
     access: Option<&'a CppAccessKind>,
     // HotScalarWrite and LoopHotness can describe the same memory access.
     // Non-access evidence still needs its distinct topology/concurrency role.
@@ -570,11 +573,14 @@ struct EvidenceRole<'a> {
     shared: bool,
     raw_pointer: bool,
     guards: &'a [String],
+    object_identity: Option<&'a str>,
+    execution_identity: Option<&'a str>,
 }
 
 fn evidence_field_role(item: &CppEvidenceItem) -> EvidenceFieldRole<'_> {
     EvidenceFieldRole {
         field: item.field_name.as_deref(),
+        element_member_path: &item.element_member_path,
         access: item.access_kind.as_ref(),
         non_access_kind: item.access_kind.is_none().then_some(&item.kind),
         heap_element: item.kind == CppEvidenceKind::ContiguousElementAccess,
@@ -595,11 +601,19 @@ fn evidence_role(item: &CppEvidenceItem) -> EvidenceRole<'_> {
         shared: item.through_shared_indirection,
         raw_pointer: item.through_raw_pointer,
         guards: &item.guard_ids,
+        object_identity: item.object_identity.as_deref(),
+        execution_identity: item.execution_identity.as_deref(),
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct CppEvidenceItem {
+    /// A resolved value-object declaration. Unknown pointers/aliases have no
+    /// identity; differing known identities cannot be one same-object base.
+    pub object_identity: Option<String>,
+    /// Lexical callable/branch associated with this actual access. Unknown
+    /// execution roles cannot establish a negative pair exclusion.
+    pub execution_identity: Option<String>,
     /// Resolved inline members inside a contiguous element. The owning field
     /// remains the storage identity; these are projections, not pointer slots.
     pub element_member_path: Vec<String>,

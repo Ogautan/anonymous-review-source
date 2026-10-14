@@ -450,6 +450,8 @@ pub(super) fn collect_uses(
                 contiguous_element: false,
                 element_index: None,
                 element_member_path: Vec::new(),
+                object_identity: None,
+                execution_identity: None,
             });
     });
 }

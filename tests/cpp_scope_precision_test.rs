@@ -39,6 +39,102 @@ fn requested_root_and_ancestors_do_not_change_cpp_discovery() {
     }
 }
 
+#[test]
+fn same_object_fields_do_not_combine_disjoint_value_receivers() {
+    use false_sharing_detector::cpp_detection::analyze_cpp_path_with_options;
+    use false_sharing_detector::types::AnalysisOptions;
+    use std::fs;
+    for block in [32, 64, 128] {
+        for (receiver, expected) in [("second", false), ("first", true), ("alias", true)] {
+            let root = tempfile::tempdir().unwrap();
+            let source = format!(
+                r#"
+#include <atomic>
+#include <thread>
+namespace {{
+struct alignas(128) State {{ std::atomic<unsigned long> a{{0}}, b{{0}}; }};
+State first, second;
+State& alias = first;
+void left() {{ for (int k=0;k<10000;++k) first.a.fetch_add(1); }}
+void right() {{ for (int k=0;k<10000;++k) {receiver}.b.fetch_add(1); }}
+}}
+int main() {{ std::thread x(left), y(right); x.join(); y.join(); }}
+"#
+            );
+            fs::write(root.path().join("main.cpp"), &source).unwrap();
+            let report = analyze_cpp_path_with_options(
+                root.path(),
+                &AnalysisOptions {
+                    cache_line_size: block,
+                    ..AnalysisOptions::with_rules(&[RuleId::SameObjectFields])
+                },
+            );
+            assert!(!report.analysis_incomplete, "{report:#?}");
+            assert_eq!(
+                !report.findings.is_empty(),
+                expected,
+                "B={block}: {source}\n{report:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn extern_declarations_in_different_files_can_name_the_same_object() {
+    use false_sharing_detector::cpp_detection::analyze_cpp_path_with_options;
+    use false_sharing_detector::types::AnalysisOptions;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("state.hpp"),
+        "struct State { std::atomic<int> a{0}, b{0}; };\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("left.cpp"),
+        "#include \"state.hpp\"\nextern State shared;\nvoid left() { shared.a.fetch_add(1); }\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("right.cpp"),
+        "#include \"state.hpp\"\nextern State shared;\nvoid right() { shared.b.fetch_add(1); }\nvoid run() { std::thread x(left), y(right); x.join(); y.join(); }\n").unwrap();
+    let report = analyze_cpp_path_with_options(
+        root.path(),
+        &AnalysisOptions::with_rules(&[RuleId::SameObjectFields]),
+    );
+    assert!(!report.analysis_incomplete, "{report:#?}");
+    assert!(!report.findings.is_empty(), "{report:#?}");
+}
+
+#[test]
+fn independent_execution_evidence_stays_with_its_object_pair() {
+    use false_sharing_detector::cpp_detection::analyze_cpp_path_with_options;
+    use false_sharing_detector::types::AnalysisOptions;
+    for (receiver, expected) in [("second", false), ("first", true)] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("main.cpp"),
+            format!(
+                r#"
+#include <atomic>
+#include <thread>
+namespace {{
+struct alignas(128) State {{ std::atomic<int> a{{0}}, b{{0}}; }};
+State first, second;
+void both() {{ first.a.fetch_add(1); first.b.fetch_add(1); }}
+void only_b() {{ {receiver}.b.fetch_add(1); }}
+}}
+int main() {{ std::thread x(both), y(only_b); x.join(); y.join(); }}
+"#
+            ),
+        )
+        .unwrap();
+        let report = analyze_cpp_path_with_options(
+            root.path(),
+            &AnalysisOptions::with_rules(&[RuleId::SameObjectFields]),
+        );
+        assert_eq!(!report.findings.is_empty(), expected, "{report:#?}");
+    }
+}
+
 fn accesses(body: &str) -> Vec<CppEvidenceItem> {
     let files = parse_cpp_files(vec![CppFile {
         path: "candidate.hpp".into(),
@@ -673,5 +769,38 @@ fn source_discovery_does_not_exclude_a_project_filename_prefix() {
         );
         assert_eq!(report.scanned_files, 1, "{report:#?}");
         assert!(!report.findings.is_empty(), "{report:#?}");
+    }
+}
+
+#[test]
+fn separate_inline_workers_keep_their_value_object_pair() {
+    use false_sharing_detector::cpp_detection::analyze_cpp_path_with_options;
+    use false_sharing_detector::types::AnalysisOptions;
+    for (receiver, expected) in [("second", false), ("first", true)] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("main.cpp"),
+            format!(
+                r#"
+#include <atomic>
+#include <thread>
+namespace {{
+struct alignas(128) State {{ std::atomic<int> a{{0}}, b{{0}}; }};
+State first, second;
+void run() {{
+ std::thread x([] {{ for(int i=0;i<1000;++i) first.a.fetch_add(1); }}), y([] {{ for(int i=0;i<1000;++i) {receiver}.b.fetch_add(1); }});
+ x.join(); y.join();
+}}
+}}
+int main() {{ run(); }}
+"#
+            ),
+        )
+        .unwrap();
+        let report = analyze_cpp_path_with_options(
+            root.path(),
+            &AnalysisOptions::with_rules(&[RuleId::SameObjectFields]),
+        );
+        assert_eq!(!report.findings.is_empty(), expected, "{report:#?}");
     }
 }

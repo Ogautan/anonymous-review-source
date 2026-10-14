@@ -502,6 +502,15 @@ fn same_object_pair_reason_with_roles(
                 continue;
             }
             let names = [left.name.clone(), right.name.clone()];
+            if facts.is_none_or(|set| set.truncated_items == 0)
+                && !super::pattern::same_object_accesses_may_alias(
+                    &accesses,
+                    &left.name,
+                    &right.name,
+                )
+            {
+                continue;
+            }
             // Approximate offsets use a fallback size for unknown members.
             // Those placeholders can enumerate speculative pairs but cannot
             // certify the byte distance of a default reviewable finding.
@@ -736,6 +745,7 @@ fn role_witnesses_with_roles(
                 // witnesses retain the actual callee and source locations.
                 copy.file = "cpp_runtime_entry".into();
                 copy.function_name = Some(entry.clone());
+                copy.execution_identity = Some(entry.clone());
                 projected.push((copy, access));
             }
         } else {
@@ -771,6 +781,7 @@ fn role_witnesses_with_roles(
                 && s.field_name == source.field_name
                 && s.access_kind == source.access_kind
                 && s.function_name == source.function_name
+                && s.execution_identity == source.execution_identity
         }) {
             sources.push((*source).clone());
         }
@@ -786,7 +797,7 @@ fn role_witnesses_matching(
     let mut functions = Vec::new();
     for access in accesses {
         if let Some(function) = &access.function_name {
-            let key = (&access.file, function);
+            let key = (&access.file, function, &access.execution_identity);
             if !functions.contains(&key) {
                 functions.push(key);
             }
@@ -798,9 +809,9 @@ fn role_witnesses_matching(
                 .iter()
                 .copied()
                 .filter(|a| {
-                    a.function_name
-                        .as_ref()
-                        .is_some_and(|f| [*left, *right].contains(&(&a.file, f)))
+                    a.function_name.as_ref().is_some_and(|f| {
+                        [*left, *right].contains(&(&a.file, f, &a.execution_identity))
+                    })
                 })
                 .collect::<Vec<_>>();
             if !super::pattern::has_distinct_cpp_access_roles(&pair)
@@ -821,7 +832,9 @@ fn role_witnesses_matching(
                     if a.field_name.is_none()
                         || b.field_name.is_none()
                         || a.field_name == b.field_name
-                        || (a.file == b.file && a.function_name == b.function_name)
+                        || (a.file == b.file
+                            && a.function_name == b.function_name
+                            && a.execution_identity == b.execution_identity)
                         || a.access_kind.is_none()
                         || b.access_kind.is_none()
                     {

@@ -1985,6 +1985,16 @@ pub(super) fn access_evidence_context(item: &CppEvidenceItem) -> AccessEvidenceC
             .iter()
             .map(|guard| format!("cpp_guarded_by:{guard}"))
             .chain(
+                item.object_identity
+                    .as_ref()
+                    .map(|identity| format!("cpp_object_identity:{identity}")),
+            )
+            .chain(
+                item.execution_identity
+                    .as_ref()
+                    .map(|identity| format!("cpp_execution_identity:{identity}")),
+            )
+            .chain(
                 item.through_thread_local
                     .then(|| "cpp_thread_local_receiver".to_string()),
             )

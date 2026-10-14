@@ -1939,6 +1939,10 @@ fn container_element_locations(
     for item in evidence.into_iter().flat_map(|set| &set.evidence) {
         if item.field_name.as_deref() != Some(&field.name)
             || item.access_kind.is_none()
+            || item
+                .semantic_contexts
+                .iter()
+                .any(|context| context == "container_element_pointee")
             || (item.access_mode.is_exclusive()
                 && !item.in_concurrent_context
                 && !item.through_shared_indirection
@@ -2123,6 +2127,10 @@ fn has_container_element_access(evidence: Option<&ConcurrencyEvidenceSet>, field
         .any(|item| {
             item.field_name.as_deref() == Some(field)
                 && item.access_kind.is_some()
+                && !item
+                    .semantic_contexts
+                    .iter()
+                    .any(|context| context == "container_element_pointee")
                 && (!item.access_mode.is_exclusive()
                     || item.in_concurrent_context
                     || item.through_shared_indirection

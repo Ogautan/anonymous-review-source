@@ -1038,6 +1038,13 @@ impl ConcurrencyEvidenceSet {
         let mut all_fields = HashSet::new();
 
         for item in &self.evidence {
+            if item
+                .semantic_contexts
+                .iter()
+                .any(|context| context == "container_element_pointee")
+            {
+                continue;
+            }
             if !matches!(
                 item.access_kind,
                 Some(AtomicAccessKind::Write | AtomicAccessKind::ReadModifyWrite)
@@ -1087,6 +1094,13 @@ impl ConcurrencyEvidenceSet {
         let mut has_candidate_access = false;
 
         for item in &self.evidence {
+            if item
+                .semantic_contexts
+                .iter()
+                .any(|context| context == "container_element_pointee")
+            {
+                continue;
+            }
             let Some(field_name) = item.field_name.as_deref() else {
                 continue;
             };
@@ -1263,14 +1277,14 @@ pub enum IterationEstimate {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AtomicAccessKind {
     Read,            // load
     Write,           // store
     ReadModifyWrite, // fetch_add, fetch_sub, swap, compare_exchange, etc.
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EvidenceKind {
     ArcWrapped,
     MutexWrapped,

@@ -115,6 +115,61 @@ fn container_candidates_require_distinct_accessible_elements() {
 }
 
 #[test]
+fn pointer_element_effects_do_not_mutate_contiguous_pointer_slots() {
+    for block in [32, 64, 128] {
+        for storage in [
+            "Vec<Arc<AtomicU64>>",
+            "Vec<Box<AtomicU64>>",
+            "Vec<&'static AtomicU64>",
+            "Box<[Arc<AtomicU64>]>",
+        ] {
+            let source = format!(
+                "use std::sync::{{Arc, atomic::{{AtomicU64, Ordering::Relaxed}}}};\npub struct State {{ bits: {storage} }}\nimpl State {{ pub fn update(&self, index: usize) {{ self.bits[index].fetch_add(1, Relaxed); }} }}"
+            );
+            assert!(
+                container_findings(&source, block).is_empty(),
+                "B={block}: {source}"
+            );
+        }
+        for (projection, expected) in [(0, false), (1, true)] {
+            let source = format!(
+                "use std::sync::{{Arc, atomic::{{AtomicU64, Ordering::Relaxed}}}};\npub struct State {{ bits: Vec<(Arc<AtomicU64>, AtomicU64)> }}\nimpl State {{ pub fn update(&self, index: usize) {{ self.bits[index].{projection}.fetch_add(1, Relaxed); }} }}"
+            );
+            assert_eq!(
+                !container_findings(&source, block).is_empty(),
+                expected,
+                "B={block}: {source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn private_container_in_a_non_sync_owner_needs_a_legal_sharing_path() {
+    for block in [32, 64, 128] {
+        for (owner, projection, expected) in [
+            ("std::rc::Rc<()>", "", false),
+            ("std::cell::Cell<usize>", "", false),
+            (
+                "std::rc::Rc<()>",
+                "pub fn bits(&self) -> &[AtomicU64] { &self.bits }",
+                true,
+            ),
+            ("usize", "", true),
+        ] {
+            let source = format!(
+                "use std::sync::atomic::{{AtomicU64, Ordering::Relaxed}};\npub struct State {{ bits: Vec<AtomicU64>, owner: {owner} }}\nimpl State {{ {projection} pub fn update(&self, index: usize) {{ self.bits[index].fetch_add(1, Relaxed); }} }}"
+            );
+            assert_eq!(
+                !container_findings(&source, block).is_empty(),
+                expected,
+                "B={block}: {source}"
+            );
+        }
+    }
+}
+
+#[test]
 fn constant_index_tracking_respects_shadowing_and_other_fields() {
     for body in [
         "let slot = 0; { let slot = index; self.bits[slot].fetch_add(1, Relaxed); }",

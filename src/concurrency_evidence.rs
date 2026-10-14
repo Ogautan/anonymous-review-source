@@ -105,6 +105,7 @@ struct MacroSemanticSummary {
 
 #[derive(Clone, Debug)]
 struct GlobalTypeBinding {
+    name: String,
     module_path: String,
     ty: String,
 }
@@ -116,6 +117,7 @@ struct SemanticDeclarationIndex {
     imports: ModuleImports,
     macros: HashMap<(String, String), Vec<MacroSemanticSummary>>,
     globals: HashMap<(String, String), Vec<GlobalTypeBinding>>,
+    native_namespace_shadows: HashSet<(String, String)>,
 }
 
 /// Collects concurrency evidence for all struct types across all parsed files.
@@ -151,6 +153,8 @@ pub fn collect_concurrency_evidence_with_stats(
     let semantic_declarations = collect_semantic_declarations(files);
     let mut function_summaries: HashMap<FunctionKey, FunctionSummary> = HashMap::new();
     let mut call_sites = Vec::new();
+    let escaped_functions = escaped_callable_names(files);
+    let owned_defaults = owned_default_types(files);
 
     for pf in files {
         let crate_name = pf
@@ -181,10 +185,14 @@ pub fn collect_concurrency_evidence_with_stats(
             struct_fields: &struct_fields,
             macro_summaries: &semantic_declarations.macros,
             global_bindings: &semantic_declarations.globals,
+            native_namespace_shadows: &semantic_declarations.native_namespace_shadows,
             imports: &semantic_declarations.imports,
             scoped_vars: vec![HashMap::new()],
             scoped_symbolic_vars: vec![HashSet::new()],
             scoped_indices: vec![HashMap::new()],
+            held_guards: Vec::new(),
+            escaped_functions: &escaped_functions,
+            owned_defaults: &owned_defaults,
         };
         collector.visit_file(&pf.ast);
 
@@ -203,15 +211,21 @@ pub fn collect_concurrency_evidence_with_stats(
     } else {
         0
     };
+    let truncated_facts = propagation_truncations
+        + function_summaries
+            .values()
+            .map(|summary| summary.truncated_accesses)
+            .sum::<usize>();
+    if truncated_facts > 0 {
+        for item in evidence_map.values_mut().flat_map(|set| &mut set.evidence) {
+            item.semantic_contexts
+                .push("rust_object_evidence_incomplete".into());
+        }
+    }
     sort_evidence_sets(&mut evidence_map);
-
     ConcurrencyEvidenceCollection {
         evidence_map,
-        truncated_facts: propagation_truncations
-            + function_summaries
-                .values()
-                .map(|summary| summary.truncated_accesses)
-                .sum::<usize>(),
+        truncated_facts,
     }
 }
 
@@ -240,10 +254,22 @@ struct EvidenceCollector<'a> {
     struct_fields: &'a HashMap<StructKey, HashMap<String, String>>,
     macro_summaries: &'a HashMap<(String, String), Vec<MacroSemanticSummary>>,
     global_bindings: &'a HashMap<(String, String), Vec<GlobalTypeBinding>>,
+    native_namespace_shadows: &'a HashSet<(String, String)>,
     imports: &'a ModuleImports,
     scoped_vars: Vec<HashMap<String, VarBinding>>,
     scoped_symbolic_vars: Vec<HashSet<String>>,
     scoped_indices: Vec<HashMap<String, IndexBinding>>,
+    held_guards: Vec<HeldGuard>,
+    escaped_functions: &'a HashSet<String>,
+    owned_defaults: &'a HashSet<StructKey>,
+}
+
+#[derive(Clone)]
+struct HeldGuard {
+    owner: String,
+    identity: String,
+    origin: Option<ValueOrigin>,
+    depth: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -260,6 +286,8 @@ enum ValueOrigin {
 
 #[derive(Clone, Debug)]
 struct VarBinding {
+    object_identity: Option<String>,
+    object_suffix: Option<String>,
     struct_name: String,
     access_path: String,
     access_mode: AccessMode,
@@ -271,6 +299,8 @@ struct VarBinding {
 
 #[derive(Clone, Debug)]
 struct ResolvedAccess {
+    object_identity: Option<String>,
+    object_suffix: Option<String>,
     struct_name: String,
     field_name: String,
     access_path: String,
@@ -289,7 +319,17 @@ impl<'a> EvidenceCollector<'a> {
             return;
         };
 
-        for context in self.active_semantic_contexts() {
+        let mut contexts = self.active_semantic_contexts();
+        contexts.extend(
+            self.held_guards
+                .iter()
+                .filter(|guard| {
+                    guard.origin.is_none()
+                        || guard.origin == semantic_value_origin(&item.semantic_contexts)
+                })
+                .map(|guard| format!("rust_guarded_by:{}", guard.identity)),
+        );
+        for context in contexts {
             if !item.semantic_contexts.contains(&context) {
                 item.semantic_contexts.push(context);
             }
@@ -351,6 +391,12 @@ impl<'a> EvidenceCollector<'a> {
         let Some(caller) = self.current_function_key.clone() else {
             return;
         };
+        let mut contexts = self.active_semantic_contexts();
+        contexts.extend(
+            self.held_guards
+                .iter()
+                .map(|guard| format!("rust_guarded_by:{}", guard.identity)),
+        );
         self.call_sites.push(FunctionCallSite {
             caller,
             callee,
@@ -360,7 +406,7 @@ impl<'a> EvidenceCollector<'a> {
                 .loop_analyzer
                 .calculate_hotness(&self.loop_analyzer.current_loop_context()),
             in_concurrent_context: self.in_concurrent_context || flow.force_concurrent,
-            semantic_contexts: self.active_semantic_contexts(),
+            semantic_contexts: contexts,
             through_shared_indirection: flow.through_shared_indirection,
             through_raw_pointer: flow.through_raw_pointer,
             receiver_binding: flow.receiver_binding,
@@ -571,6 +617,8 @@ impl<'a> EvidenceCollector<'a> {
 
     fn leave_scope(&mut self) {
         if self.scoped_vars.len() > 1 {
+            let depth = self.scoped_vars.len();
+            self.held_guards.retain(|guard| guard.depth < depth);
             self.scoped_vars.pop();
             self.scoped_symbolic_vars.pop();
             self.scoped_indices.pop();
@@ -588,6 +636,276 @@ impl<'a> EvidenceCollector<'a> {
             .iter()
             .rev()
             .find_map(|scope| scope.get(name).cloned())
+    }
+
+    fn acquired_guard(&self, local: &syn::Local) -> Option<HeldGuard> {
+        let Pat::Ident(owner) = &local.pat else {
+            return None;
+        };
+        let mut expr = local.init.as_ref()?.expr.as_ref();
+        while let Expr::MethodCall(call) = expr {
+            if matches!(call.method.to_string().as_str(), "unwrap" | "expect") {
+                expr = &call.receiver;
+            } else {
+                break;
+            }
+        }
+        let Expr::MethodCall(call) = expr else {
+            return None;
+        };
+        let method = call.method.to_string();
+        if !call.args.is_empty() || !matches!(method.as_str(), "lock" | "write") {
+            return None;
+        }
+        let (identity, origin, ty) = if let Some(access) = self.resolve_access(&call.receiver) {
+            let origin = access.origin?;
+            let key = self.resolve_struct_key(&access.struct_name)?;
+            let identity = format!(
+                "relative:{}:{}:{}:{}",
+                key.crate_name,
+                key.qualified_name(),
+                value_origin_context(origin),
+                access.field_name
+            );
+            (
+                identity,
+                Some(origin),
+                self.field_type_tokens(&access.struct_name, &access.field_name)?
+                    .to_owned(),
+            )
+        } else if let Expr::Path(path) = call.receiver.as_ref() {
+            let mut parts = path
+                .path
+                .segments
+                .iter()
+                .map(|part| part.ident.to_string())
+                .collect::<Vec<_>>();
+            if parts.len() == 1 {
+                let name = &parts[0];
+                if self.lexical_shadow(name) {
+                    // An unresolved local Mutex is still a lexical shadow;
+                    // it must not borrow a same-spelled static's lock identity.
+                    return None;
+                }
+                if self
+                    .global_bindings
+                    .get(&(self.crate_name.clone(), name.clone()))
+                    .is_some_and(|items| {
+                        items
+                            .iter()
+                            .any(|item| item.module_path == self.module_path)
+                    })
+                {
+                    parts =
+                        resolve_module_use_path(&self.module_path, &["self".into(), name.clone()]);
+                } else {
+                    let imports = self
+                        .imports
+                        .get(&(self.crate_name.clone(), self.module_path.clone()))?;
+                    let matches = imports
+                        .iter()
+                        .filter(|(alias, target)| {
+                            alias.as_ref().or_else(|| target.last()) == Some(name)
+                        })
+                        .collect::<Vec<_>>();
+                    let [(_, target)] = matches.as_slice() else {
+                        return None;
+                    };
+                    parts = target.clone();
+                }
+            } else {
+                if !matches!(parts[0].as_str(), "crate" | "self" | "super")
+                    && self.lexical_shadow(&parts[0])
+                {
+                    return None;
+                }
+                parts = resolve_module_use_path(&self.module_path, &parts);
+            }
+            let name = parts.pop()?;
+            let candidates = self
+                .global_bindings
+                .get(&(self.crate_name.clone(), name.clone()))?
+                .iter()
+                .filter(|item| item.module_path == parts.join("::"))
+                .collect::<Vec<_>>();
+            let [declaration] = candidates.as_slice() else {
+                return None;
+            };
+            (
+                format!(
+                    "global:{}:{}:{name}",
+                    self.crate_name, declaration.module_path
+                ),
+                None,
+                declaration.ty.clone(),
+            )
+        } else {
+            return None;
+        };
+        let wrapper = top_level_wrapper_name(&ty)?;
+        if !matches!(
+            (wrapper.as_str(), method.as_str()),
+            ("Mutex", "lock") | ("RwLock", "write")
+        ) || !self.native_lock_type(&ty)
+        {
+            return None;
+        }
+        Some(HeldGuard {
+            owner: owner.ident.to_string(),
+            identity,
+            origin,
+            depth: self.scoped_vars.len(),
+        })
+    }
+
+    fn invalidate_guards_used_by(&mut self, expression: &Expr) {
+        let used = token_identifiers(&expression.to_token_stream());
+        self.held_guards
+            .retain(|guard| !used.contains(&guard.owner));
+    }
+
+    fn lexical_shadow(&self, name: &str) -> bool {
+        self.scoped_indices
+            .iter()
+            .any(|scope| scope.contains_key(name) || scope.contains_key("*"))
+    }
+
+    fn native_namespace_shadow(&self, name: &str) -> bool {
+        self.lexical_shadow(name)
+            || self
+                .native_namespace_shadows
+                .contains(&(self.crate_name.clone(), name.to_owned()))
+    }
+
+    fn invalidate_object_binding(&mut self, expression: &Expr) {
+        match expression {
+            Expr::Path(path) if path.path.segments.len() == 1 => {
+                let name = path.path.segments[0].ident.to_string();
+                for scope in self.scoped_vars.iter_mut().rev() {
+                    if let Some(binding) = scope.get_mut(&name) {
+                        binding.object_identity = None;
+                        binding.object_suffix = None;
+                        binding.origin = None;
+                        break;
+                    }
+                }
+            }
+            Expr::Paren(expr) => self.invalidate_object_binding(&expr.expr),
+            Expr::Unary(expr) => self.invalidate_object_binding(&expr.expr),
+            _ => {}
+        }
+    }
+
+    fn invalidate_opaque_macro_effects(&mut self) {
+        // A macro can capture definition-site locals even with no input tokens.
+        // Without expansion, neither a live guard nor a mutable handle's
+        // allocation identity is a proof that survives the invocation.
+        self.held_guards.clear();
+        let mutable_names: HashSet<_> = self
+            .scoped_indices
+            .iter()
+            .flat_map(|scope| scope.iter())
+            .filter(|(_, index)| index.mutable)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for variables in &mut self.scoped_vars {
+            for (name, binding) in variables {
+                if mutable_names.contains(name) {
+                    binding.object_identity = None;
+                    binding.object_suffix = None;
+                    binding.origin = None;
+                }
+            }
+        }
+    }
+
+    fn native_lock_type(&self, ty: &str) -> bool {
+        let Ok(syn::Type::Path(ty)) = syn::parse_str::<syn::Type>(ty) else {
+            return false;
+        };
+        let parts = ty
+            .path
+            .segments
+            .iter()
+            .map(|part| part.ident.to_string())
+            .collect::<Vec<_>>();
+        let native = |parts: &[String]| {
+            matches!(
+                parts
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                ["std", "sync", "Mutex" | "RwLock"] | ["parking_lot", "Mutex" | "RwLock"]
+            )
+        };
+        if parts.len() > 1 {
+            return native(&parts)
+                && (ty.path.leading_colon.is_some() || !self.native_namespace_shadow(&parts[0]))
+                && (ty.path.leading_colon.is_some() || !self.known_struct(parts.last().unwrap()));
+        }
+        let Some(name) = parts.first() else {
+            return false;
+        };
+        if self.known_struct(name) {
+            return false;
+        }
+        if self.lexical_shadow(name) {
+            return false;
+        }
+        let Some(imports) = self
+            .imports
+            .get(&(self.crate_name.clone(), self.module_path.clone()))
+        else {
+            return false;
+        };
+        let mut targets = imports
+            .iter()
+            .filter(|(alias, path)| alias.as_ref().or_else(|| path.last()) == Some(name))
+            .map(|(_, path)| path)
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        matches!(targets.as_slice(), [target] if native(target) && !self.native_namespace_shadow(&target[0]))
+    }
+
+    fn native_allocator_path(&self, parts: &[String]) -> bool {
+        let native = |parts: &[String]| {
+            matches!(
+                parts
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                ["std" | "alloc", "sync", "Arc"] | ["std" | "alloc", "boxed", "Box"]
+            )
+        };
+        if parts.len() > 1 {
+            return native(parts)
+                && !self.known_struct(parts.last().unwrap())
+                && !self.native_namespace_shadow(&parts[0]);
+        }
+        let Some(name) = parts.first() else {
+            return false;
+        };
+        if self.known_struct(name) {
+            return false;
+        }
+        if self.lexical_shadow(name) {
+            return false;
+        }
+        let mut targets = self
+            .imports
+            .get(&(self.crate_name.clone(), self.module_path.clone()))
+            .into_iter()
+            .flatten()
+            .filter(|(alias, path)| alias.as_ref().or_else(|| path.last()) == Some(name))
+            .map(|(_, path)| path)
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        matches!(targets.as_slice(), [target] if native(target) && !self.native_namespace_shadow(&target[0]))
+            || (targets.is_empty() && name == "Box")
     }
 
     fn index_value(&self, expression: &Expr) -> IndexValue {
@@ -854,6 +1172,8 @@ impl<'a> EvidenceCollector<'a> {
             let outer_wrapper = top_level_wrapper_name(ty);
             let through_raw_pointer = type_is_raw_pointer_like(ty);
             Some(VarBinding {
+                object_identity: None,
+                object_suffix: Some(String::new()),
                 struct_name,
                 access_path,
                 access_mode: access_mode_from_type_tokens(ty),
@@ -883,6 +1203,8 @@ impl<'a> EvidenceCollector<'a> {
                 let name = path.path.segments.last()?.ident.to_string();
                 if name == "self" || name == "Self" {
                     Some(VarBinding {
+                        object_identity: None,
+                        object_suffix: Some(String::new()),
                         struct_name: self.current_impl_type.clone()?,
                         access_path: "self".to_string(),
                         access_mode: self.current_receiver_mode.unwrap_or(AccessMode::Unknown),
@@ -898,7 +1220,16 @@ impl<'a> EvidenceCollector<'a> {
                         .or_else(|| self.binding_from_global(&path.path))
                 }
             }
-            Expr::Reference(reference) => self.binding_from_expr(&reference.expr),
+            Expr::Reference(reference) => {
+                self.binding_from_expr(&reference.expr).map(|mut binding| {
+                    binding.access_mode = if reference.mutability.is_some() {
+                        AccessMode::Exclusive
+                    } else {
+                        AccessMode::Shared
+                    };
+                    binding
+                })
+            }
             Expr::Unary(unary) => self.binding_from_expr(&unary.expr),
             Expr::Paren(paren) => self.binding_from_expr(&paren.expr),
             Expr::Await(await_expr) => self.binding_from_expr(&await_expr.base),
@@ -912,6 +1243,63 @@ impl<'a> EvidenceCollector<'a> {
             }),
             Expr::Call(call) => {
                 let func = call.func.to_token_stream().to_string();
+                if let Expr::Path(path) = call.func.as_ref() {
+                    let parts = path
+                        .path
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect::<Vec<_>>();
+                    if parts.last().is_some_and(|name| name == "new")
+                        && parts
+                            .iter()
+                            .rev()
+                            .nth(1)
+                            .is_some_and(|name| matches!(name.as_str(), "Arc" | "Box"))
+                        && self.native_allocator_path(&parts[..parts.len() - 1])
+                        && call.args.len() == 1
+                        && let Some(mut binding) = self.binding_from_expr(&call.args[0])
+                    {
+                        let wrapper = parts[parts.len() - 2].clone();
+                        if binding.outer_wrapper.is_none()
+                            && binding.access_mode.is_exclusive()
+                            && !binding.through_shared_indirection
+                            && !binding.through_raw_pointer
+                        {
+                            binding.object_identity = Some(format!(
+                                "allocation:{}:{}:{}",
+                                self.file,
+                                expr.span().start().line,
+                                expr.span().start().column
+                            ));
+                            binding.object_suffix = Some(String::new());
+                        }
+                        binding.outer_wrapper = Some(wrapper.clone());
+                        binding.through_shared_indirection |= wrapper == "Arc";
+                        binding.access_mode = if binding.through_shared_indirection {
+                            AccessMode::Shared
+                        } else {
+                            AccessMode::Exclusive
+                        };
+                        return Some(binding);
+                    }
+                    let owner = parts[..parts.len().saturating_sub(1)].join("::");
+                    if parts.last().is_some_and(|name| name == "default")
+                        && !owner.is_empty()
+                        && self
+                            .resolve_struct_key(&owner)
+                            .is_some_and(|key| self.owned_defaults.contains(&key))
+                        && let Some(mut binding) = self.binding_from_type(&owner, func.clone())
+                    {
+                        binding.object_identity = Some(format!(
+                            "value:{}:{}:{}",
+                            self.file,
+                            expr.span().start().line,
+                            expr.span().start().column
+                        ));
+                        return Some(binding);
+                    }
+                }
                 if (func.contains("Arc :: clone") || func.contains("std :: sync :: Arc :: clone"))
                     && call.args.len() == 1
                 {
@@ -1026,6 +1414,20 @@ impl<'a> EvidenceCollector<'a> {
                             .field_type_tokens(&access.struct_name, &access.field_name)
                             .is_some_and(type_is_raw_pointer_like);
                     Some(VarBinding {
+                        object_identity: if through_shared_indirection || through_raw_pointer {
+                            None
+                        } else {
+                            access
+                                .object_identity
+                                .map(|identity| format!("{identity}.{}", access.field_name))
+                        },
+                        object_suffix: if through_shared_indirection || through_raw_pointer {
+                            None
+                        } else {
+                            access
+                                .object_suffix
+                                .map(|suffix| format!("{suffix}.{}", access.field_name))
+                        },
                         struct_name: next_type,
                         access_path: access.access_path,
                         access_mode: if through_raw_pointer {
@@ -1044,6 +1446,19 @@ impl<'a> EvidenceCollector<'a> {
                     None
                 }
             }),
+            Expr::Struct(record) => {
+                let mut binding = self.binding_from_type(
+                    &record.path.to_token_stream().to_string(),
+                    expr.to_token_stream().to_string(),
+                )?;
+                binding.object_identity = Some(format!(
+                    "value:{}:{}:{}",
+                    self.file,
+                    expr.span().start().line,
+                    expr.span().start().column
+                ));
+                Some(binding)
+            }
             _ => None,
         }
     }
@@ -1055,6 +1470,14 @@ impl<'a> EvidenceCollector<'a> {
             .map(|part| part.ident.to_string())
             .collect();
         let name = parts.last()?;
+        if parts.len() == 1 && self.lexical_shadow(name)
+            || parts.first().is_some_and(|prefix| {
+                !matches!(prefix.as_str(), "crate" | "self" | "super")
+                    && self.lexical_shadow(prefix)
+            })
+        {
+            return None;
+        }
         let mut targets = Vec::new();
         if parts.len() > 1 {
             targets.push(resolve_module_use_path(&self.module_path, &parts));
@@ -1130,6 +1553,15 @@ impl<'a> EvidenceCollector<'a> {
             &ty_name,
         )?;
         Some(VarBinding {
+            object_identity: (!type_has_shared_indirection(&selected.ty)
+                && !type_is_raw_pointer_like(&selected.ty))
+            .then(|| {
+                format!(
+                    "global:{}:{}:{}",
+                    self.crate_name, selected.module_path, selected.name
+                )
+            }),
+            object_suffix: Some(String::new()),
             struct_name: format!("crate::{}", key.qualified_name()),
             access_path: path.to_token_stream().to_string(),
             access_mode: AccessMode::Unknown,
@@ -1255,6 +1687,16 @@ impl<'a> EvidenceCollector<'a> {
         };
 
         if let Some(access) = self.resolve_access(&node.receiver) {
+            let mut access_contexts = access_semantic_contexts(&access);
+            if access.is_indexed
+                && self
+                    .field_type_tokens(&access.struct_name, &access.field_name)
+                    .is_some_and(|ty| indexed_pointee_type(ty, &node.receiver))
+            {
+                // Auto-deref operates on an independently allocated payload,
+                // not on the contiguous Arc/Box/reference slot in the vector.
+                access_contexts.push("container_element_pointee".to_string());
+            }
             // `.get()` is not a universal read operation.  Ordinary value
             // getters (including Cell::get) return a value, while
             // UnsafeCell::get exposes a mutable raw pointer whose later use
@@ -1287,7 +1729,7 @@ impl<'a> EvidenceCollector<'a> {
                     function_name: self.current_function.clone(),
                     propagation_depth: 0,
                     call_path: Vec::new(),
-                    semantic_contexts: access_semantic_contexts(&access),
+                    semantic_contexts: access_contexts,
                     through_shared_indirection: access.through_shared_indirection,
                     through_raw_pointer: access.through_raw_pointer,
                     description: format!(
@@ -1314,6 +1756,8 @@ impl<'a> EvidenceCollector<'a> {
         let mut access_mode = base.access_mode;
         let mut through_shared_indirection = base.through_shared_indirection;
         let mut through_raw_pointer = base.through_raw_pointer;
+        let mut object_identity = base.object_identity;
+        let mut object_suffix = base.object_suffix;
         for (idx, segment) in segments.iter().enumerate() {
             if !current_path.is_empty() {
                 current_path.push('.');
@@ -1323,6 +1767,8 @@ impl<'a> EvidenceCollector<'a> {
             let is_last = idx == segments.len() - 1;
             if is_last {
                 return Some(ResolvedAccess {
+                    object_identity,
+                    object_suffix,
                     struct_name: current_struct,
                     field_name: segment.clone(),
                     access_path: current_path,
@@ -1351,6 +1797,8 @@ impl<'a> EvidenceCollector<'a> {
                     current_path.push_str(projection);
                 }
                 return Some(ResolvedAccess {
+                    object_identity,
+                    object_suffix,
                     struct_name: current_struct,
                     field_name: segment.clone(),
                     access_path: current_path,
@@ -1365,6 +1813,26 @@ impl<'a> EvidenceCollector<'a> {
             }
 
             let field_ty = self.field_type_tokens(&current_struct, segment)?;
+            if type_has_shared_indirection(field_ty) || type_is_raw_pointer_like(field_ty) {
+                object_identity = None;
+                object_suffix = None;
+            } else {
+                object_identity = object_identity.map(|identity| format!("{identity}.{segment}"));
+                object_suffix = object_suffix.map(|suffix| format!("{suffix}.{segment}"));
+                if syn::parse_str::<syn::Type>(field_ty)
+                    .ok()
+                    .is_some_and(|ty| is_native_sequence_type(&ty))
+                {
+                    let index = self
+                        .element_index(expr, segment)
+                        .and_then(|index| index.constant());
+                    object_identity = index.and_then(|index| {
+                        object_identity.map(|identity| format!("{identity}[{index}]"))
+                    });
+                    object_suffix = index
+                        .and_then(|index| object_suffix.map(|suffix| format!("{suffix}[{index}]")));
+                }
+            }
             if type_has_shared_indirection(field_ty) {
                 access_mode = AccessMode::Shared;
                 through_shared_indirection = true;
@@ -1407,6 +1875,8 @@ impl<'a> EvidenceCollector<'a> {
                 let name = path.path.segments.last()?.ident.to_string();
                 if name == "self" || name == "Self" {
                     Some(VarBinding {
+                        object_identity: None,
+                        object_suffix: Some(String::new()),
                         struct_name: self.current_impl_type.clone()?,
                         access_path: "self".to_string(),
                         access_mode: self.current_receiver_mode.unwrap_or(AccessMode::Unknown),
@@ -1423,6 +1893,8 @@ impl<'a> EvidenceCollector<'a> {
                         .or_else(|| {
                             if self.known_struct(&name) {
                                 Some(VarBinding {
+                                    object_identity: None,
+                                    object_suffix: Some(String::new()),
                                     struct_name: name.clone(),
                                     access_path: name,
                                     access_mode: AccessMode::Unknown,
@@ -1597,8 +2069,21 @@ impl<'a> EvidenceCollector<'a> {
 
     fn handle_local_binding(&mut self, node: &syn::Local) {
         if let Pat::Type(pat_ty) = &node.pat
-            && let Some((name, binding)) = self.binding_from_pat_type(pat_ty)
+            && let Some((name, mut binding)) = self.binding_from_pat_type(pat_ty)
         {
+            binding.object_identity = node
+                .init
+                .as_ref()
+                .and_then(|init| self.binding_from_expr(&init.expr))
+                .and_then(|value| value.object_identity);
+            if !crate::helpers::is_indirection_type(&pat_ty.ty.to_token_stream().to_string()) {
+                binding.object_identity = Some(format!(
+                    "value:{}:{}:{}",
+                    self.file,
+                    node.span().start().line,
+                    node.span().start().column
+                ));
+            }
             self.bind_var(name, binding);
             return;
         }
@@ -1728,6 +2213,7 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
         if cfg_is_test_only(&node.attrs) {
             return;
         }
+        let saved_guards = std::mem::take(&mut self.held_guards);
         let key = FunctionKey {
             crate_name: self.crate_name.clone(),
             module_path: self.module_path.clone(),
@@ -1745,6 +2231,13 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
             self.current_impl_trait.as_deref(),
             self.current_impl_is_generic,
         );
+        if !matches!(node.vis, syn::Visibility::Inherited)
+            || self.current_impl_trait.is_some()
+            || self.escaped_functions.contains(&node.sig.ident.to_string())
+        {
+            self.current_semantic_contexts
+                .push("rust_callable_exposed".into());
+        }
         let prev_receiver_mode = self.current_receiver_mode.replace(AccessMode::Unknown);
         self.enter_scope();
         let mut parameter_index = 0;
@@ -1777,12 +2270,14 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
         self.current_function_key = prev_key;
         self.current_semantic_contexts = prev_contexts;
         self.current_receiver_mode = prev_receiver_mode;
+        self.held_guards = saved_guards;
     }
 
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         if cfg_is_test_only(&node.attrs) {
             return;
         }
+        let saved_guards = std::mem::take(&mut self.held_guards);
         let key = FunctionKey {
             crate_name: self.crate_name.clone(),
             module_path: self.module_path.clone(),
@@ -1796,6 +2291,12 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
         let prev_contexts = std::mem::take(&mut self.current_semantic_contexts);
         self.current_semantic_contexts =
             function_semantic_contexts(&node.sig, None, None, !node.sig.generics.params.is_empty());
+        if !matches!(node.vis, syn::Visibility::Inherited)
+            || self.escaped_functions.contains(&node.sig.ident.to_string())
+        {
+            self.current_semantic_contexts
+                .push("rust_callable_exposed".into());
+        }
         self.enter_scope();
         let mut parameter_index = 0;
         for input in &node.sig.inputs {
@@ -1825,10 +2326,40 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
         self.current_function = prev_function;
         self.current_function_key = prev_key;
         self.current_semantic_contexts = prev_contexts;
+        self.held_guards = saved_guards;
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
         self.enter_scope();
+        // Items/imports are visible throughout their block, including before
+        // their textual declaration. Unknown shadows cannot name a global
+        // storage object or a native allocator/lock by spelling alone.
+        let scope = self.scoped_indices.last_mut().unwrap();
+        for statement in &node.stmts {
+            let names = match statement {
+                syn::Stmt::Item(syn::Item::Use(item)) => {
+                    let mut imports = Vec::new();
+                    collect_module_uses(&item.tree, &[], &mut imports);
+                    imports
+                        .into_iter()
+                        .map(|(alias, _)| alias.unwrap_or_else(|| "*".into()))
+                        .collect::<Vec<_>>()
+                }
+                syn::Stmt::Item(syn::Item::Const(item)) => vec![item.ident.to_string()],
+                syn::Stmt::Item(syn::Item::Type(item)) => vec![item.ident.to_string()],
+                syn::Stmt::Item(syn::Item::Mod(item)) => vec![item.ident.to_string()],
+                _ => Vec::new(),
+            };
+            for name in names {
+                scope.insert(
+                    name,
+                    IndexBinding {
+                        value: IndexValue::Unknown,
+                        mutable: false,
+                    },
+                );
+            }
+        }
         syn::visit::visit_block(self, node);
         if let Some(syn::Stmt::Expr(expr, None)) = node.stmts.last() {
             self.record_plain_value_read(expr, self.span_line(expr));
@@ -1837,7 +2368,37 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
     }
 
     fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+        // The enclosing thread's lockset does not dominate a deferred worker.
+        let saved = std::mem::take(&mut self.held_guards);
+        self.current_semantic_contexts.push(format!(
+            "rust_execution_domain:{}:{}:{}",
+            self.file,
+            node.span().start().line,
+            node.span().start().column
+        ));
         self.enter_scope();
+        let saved_receiver_mode = self.current_receiver_mode;
+        if node.capture.is_none() {
+            // A borrowed owner is not exclusively owned by this closure. Atomic
+            // fields in a stack/Box value can be shared by scoped workers.
+            // Explicit mutable references and callee signatures still determine
+            // the capability of operations that actually require exclusivity.
+            let captured = self.scoped_vars[..self.scoped_vars.len() - 1]
+                .iter()
+                .flat_map(|scope| scope.iter())
+                .map(|(name, binding)| {
+                    let mut binding = binding.clone();
+                    if binding.access_mode.is_exclusive() && !binding.through_raw_pointer {
+                        binding.access_mode = AccessMode::Shared;
+                    }
+                    (name.clone(), binding)
+                })
+                .collect::<HashMap<_, _>>();
+            self.scoped_vars.last_mut().unwrap().extend(captured);
+            if self.current_receiver_mode == Some(AccessMode::Exclusive) {
+                self.current_receiver_mode = Some(AccessMode::Shared);
+            }
+        }
         for input in &node.inputs {
             let value = match input {
                 Pat::Type(pat_ty) => IndexValue::from_type(&pat_ty.ty),
@@ -1861,7 +2422,11 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
             }
         }
         syn::visit::visit_expr_closure(self, node);
+        self.current_semantic_contexts.pop();
         self.leave_scope();
+        self.current_receiver_mode = saved_receiver_mode;
+        self.held_guards = saved;
+        self.invalidate_guards_used_by(&node.body);
     }
 
     fn visit_local(&mut self, node: &'ast syn::Local) {
@@ -1873,10 +2438,14 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
             .as_ref()
             .map(|init| self.index_value(&init.expr))
             .unwrap_or(IndexValue::Unknown);
-        self.handle_local_binding(node);
         syn::visit::visit_local(self, node);
         // A let binding is not in scope in its own initializer.
+        let guard = self.acquired_guard(node);
+        self.handle_local_binding(node);
         self.bind_index_pattern(&node.pat, value);
+        if let Some(guard) = guard {
+            self.held_guards.push(guard);
+        }
     }
 
     fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
@@ -2049,6 +2618,22 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        self.invalidate_guards_used_by(&node.receiver);
+        for argument in &node.args {
+            self.invalidate_guards_used_by(argument);
+        }
+        if node.method == "force_unlock" {
+            self.held_guards.clear();
+        }
+        if self
+            .binding_from_expr(&node.receiver)
+            .is_some_and(|binding| binding.outer_wrapper.is_some())
+        {
+            // Method lookup may auto-borrow a handle mutably. An unresolved
+            // method can replace an Arc/Box slot, so do not carry its previous
+            // pointee identity into this call or later accesses.
+            self.invalidate_object_binding(&node.receiver);
+        }
         self.invalidate_index_receiver(&node.receiver);
         self.check_sync_method_on_field(node);
         self.record_method_call_site(node);
@@ -2103,6 +2688,7 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
     }
 
     fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+        self.invalidate_opaque_macro_effects();
         // Macro input tokens are not ordinary visited expressions. A mutable
         // identifier may be assigned or have its address taken by expansion.
         for name in token_identifiers(&node.mac.tokens) {
@@ -2113,6 +2699,7 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
     }
 
     fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+        self.invalidate_opaque_macro_effects();
         for name in token_identifiers(&node.mac.tokens) {
             self.invalidate_mutable_index(&name);
         }
@@ -2120,6 +2707,9 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
     }
 
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        for argument in &node.args {
+            self.invalidate_guards_used_by(argument);
+        }
         self.record_function_call_site(node);
         let is_concurrent = is_concurrent_call(&node.func);
 
@@ -2164,6 +2754,8 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
 
     fn visit_expr_reference(&mut self, node: &'ast syn::ExprReference) {
         if node.mutability.is_some() {
+            self.invalidate_guards_used_by(&node.expr);
+            self.invalidate_object_binding(&node.expr);
             // The borrow can escape through either a call or a local alias.
             self.assign_index(&node.expr, IndexValue::Integer);
         }
@@ -2192,6 +2784,8 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
     }
 
     fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
+        self.invalidate_guards_used_by(&node.left);
+        self.invalidate_object_binding(&node.left);
         let line = self.span_line(node);
         self.record_plain_field_write(&node.left, line);
         self.assign_index(&node.left, self.index_value(&node.right));
@@ -2211,9 +2805,12 @@ impl<'ast, 'a> Visit<'ast> for EvidenceCollector<'a> {
     }
 
     fn visit_expr_async(&mut self, node: &'ast syn::ExprAsync) {
+        let saved = std::mem::take(&mut self.held_guards);
         self.async_context_depth += 1;
         syn::visit::visit_expr_async(self, node);
         self.async_context_depth = self.async_context_depth.saturating_sub(1);
+        self.held_guards = saved;
+        self.invalidate_guards_used_by(&Expr::Async(node.clone()));
     }
 
     fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
@@ -2303,8 +2900,215 @@ fn looks_like_type_or_trait_name(name: &str) -> bool {
     name.chars().next().is_some_and(char::is_uppercase)
 }
 
+fn owned_default_types(files: &[ParsedFile]) -> HashSet<StructKey> {
+    struct Defaults {
+        crate_name: String,
+        module: String,
+        derived: HashSet<StructKey>,
+        shadowed_crates: HashSet<String>,
+    }
+    impl<'ast> Visit<'ast> for Defaults {
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            let previous = self.module.clone();
+            self.module = join_module_path(&self.module, &node.ident.to_string());
+            syn::visit::visit_item_mod(self, node);
+            self.module = previous;
+        }
+        fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+            let key = StructKey::new(
+                self.crate_name.clone(),
+                self.module.clone(),
+                node.ident.to_string(),
+            );
+            let mut default = false;
+            for attr in &node.attrs {
+                if attr.path().is_ident("derive") {
+                    let Ok(paths) =
+                        attr.parse_args_with(Punctuated::<syn::Path, Token![,]>::parse_terminated)
+                    else {
+                        return;
+                    };
+                    if paths.iter().any(|path| {
+                        ![
+                            "Default",
+                            "Debug",
+                            "Clone",
+                            "Copy",
+                            "PartialEq",
+                            "Eq",
+                            "Ord",
+                            "PartialOrd",
+                            "Hash",
+                        ]
+                        .iter()
+                        .any(|name| path.is_ident(name))
+                    }) {
+                        return;
+                    }
+                    default |= paths.iter().any(|path| path.is_ident("Default"));
+                } else if ![
+                    "repr",
+                    "doc",
+                    "cfg",
+                    "cfg_attr",
+                    "allow",
+                    "deny",
+                    "warn",
+                    "forbid",
+                    "must_use",
+                    "non_exhaustive",
+                ]
+                .iter()
+                .any(|name| attr.path().is_ident(name))
+                {
+                    return;
+                }
+            }
+            if default {
+                self.derived.insert(key);
+            }
+        }
+        fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
+            if node.trait_.is_none() && node.items.iter().any(|item| matches!(item, syn::ImplItem::Fn(method) if method.sig.ident == "default")) {
+                // Qualified/aliased self types need name resolution. Until
+                // proved, do not use a guessed Default return type to establish
+                // distinct allocations anywhere in this crate.
+                self.shadowed_crates.insert(self.crate_name.clone());
+            }
+            syn::visit::visit_item_impl(self, node);
+        }
+    }
+    let mut collector = Defaults {
+        crate_name: String::new(),
+        module: String::new(),
+        derived: HashSet::new(),
+        shadowed_crates: HashSet::new(),
+    };
+    for file in files {
+        collector.crate_name = file.crate_name.clone().unwrap_or_else(|| "unknown".into());
+        collector.module = file.module_path.clone();
+        collector.visit_file(&file.ast);
+    }
+    collector
+        .derived
+        .retain(|key| !collector.shadowed_crates.contains(&key.crate_name));
+    collector.derived
+}
+
+fn escaped_callable_names(files: &[ParsedFile]) -> HashSet<String> {
+    struct Escapes(HashSet<String>);
+    impl<'ast> Visit<'ast> for Escapes {
+        fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+            if !matches!(node.func.as_ref(), Expr::Path(_)) {
+                self.visit_expr(&node.func);
+            }
+            for argument in &node.args {
+                self.visit_expr(argument);
+            }
+        }
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if let Some(name) = node.path.segments.last() {
+                self.0.insert(name.ident.to_string());
+            }
+        }
+        fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+            self.0.extend(token_identifiers(&node.mac.tokens));
+        }
+        fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+            self.0.extend(token_identifiers(&node.mac.tokens));
+        }
+    }
+    let mut escapes = Escapes(HashSet::new());
+    for file in files {
+        escapes.visit_file(&file.ast);
+    }
+    escapes.0
+}
+
+fn indexed_pointee_type(container: &str, receiver: &Expr) -> bool {
+    fn argument(ty: &syn::Type) -> Option<&syn::Type> {
+        let syn::Type::Path(path) = ty else {
+            return None;
+        };
+        let syn::PathArguments::AngleBracketed(args) = &path.path.segments.last()?.arguments else {
+            return None;
+        };
+        args.args.iter().find_map(|arg| match arg {
+            syn::GenericArgument::Type(ty) => Some(ty),
+            _ => None,
+        })
+    }
+    fn element(ty: &syn::Type) -> Option<&syn::Type> {
+        match ty {
+            syn::Type::Array(array) => Some(&array.elem),
+            syn::Type::Slice(slice) => Some(&slice.elem),
+            syn::Type::Path(path) => match path.path.segments.last()?.ident.to_string().as_str() {
+                "Vec" => argument(ty),
+                "Box" | "Arc" => element(argument(ty)?),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn indirect(ty: &syn::Type) -> bool {
+        match ty {
+            syn::Type::Reference(_) | syn::Type::Ptr(_) => true,
+            syn::Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+                matches!(
+                    segment.ident.to_string().as_str(),
+                    "Arc" | "Rc" | "Box" | "NonNull"
+                )
+            }),
+            _ => false,
+        }
+    }
+    fn projections(expression: &Expr, members: &mut Vec<syn::Member>) {
+        match expression {
+            Expr::Field(field) => {
+                projections(&field.base, members);
+                members.push(field.member.clone());
+            }
+            Expr::Paren(expr) => projections(&expr.expr, members),
+            Expr::Reference(expr) => projections(&expr.expr, members),
+            // Stop at the selected element; enclosing fields identify its array.
+            _ => {}
+        }
+    }
+    let Ok(container) = syn::parse_str::<syn::Type>(container) else {
+        return false;
+    };
+    let Some(mut ty) = element(&container) else {
+        return false;
+    };
+    let mut members = Vec::new();
+    projections(receiver, &mut members);
+    for member in members {
+        if indirect(ty) {
+            return true;
+        }
+        match (ty, member) {
+            (syn::Type::Tuple(tuple), syn::Member::Unnamed(index)) => {
+                let Some(next) = tuple.elems.iter().nth(index.index as usize) else {
+                    return false;
+                };
+                ty = next;
+            }
+            _ => return false,
+        }
+    }
+    indirect(ty)
+}
+
 fn access_semantic_contexts(access: &ResolvedAccess) -> Vec<String> {
     let mut contexts = Vec::new();
+    if let Some(identity) = &access.object_identity {
+        contexts.push(format!("rust_object_identity:{identity}"));
+    }
+    match &access.object_suffix {
+        Some(suffix) if !suffix.is_empty() => contexts.push(format!("rust_object_suffix:{suffix}")),
+        None => contexts.push("rust_object_suffix_unresolved".to_string()),
+        _ => {}
+    }
     if let Some(index) = access.element_index {
         contexts.push(index.context());
     }
@@ -2498,6 +3302,53 @@ fn propagate_function_summaries(
                         || (semantic_value_origin(&propagated.item.semantic_contexts).is_none()
                             && call.through_raw_pointer);
                     if let Some(binding) = value_binding {
+                        let suffix = propagated
+                            .item
+                            .semantic_contexts
+                            .iter()
+                            .find_map(|context| context.strip_prefix("rust_object_suffix:"))
+                            .unwrap_or("")
+                            .to_owned();
+                        let unresolved = binding.object_suffix.is_none()
+                            || propagated
+                                .item
+                                .semantic_contexts
+                                .iter()
+                                .any(|context| context == "rust_object_suffix_unresolved");
+                        propagated.item.semantic_contexts.retain(|context| {
+                            !context.starts_with("rust_object_suffix:")
+                                && context != "rust_object_suffix_unresolved"
+                        });
+                        if unresolved {
+                            propagated
+                                .item
+                                .semantic_contexts
+                                .retain(|context| !context.starts_with("rust_object_identity:"));
+                            propagated
+                                .item
+                                .semantic_contexts
+                                .push("rust_object_suffix_unresolved".into());
+                        } else if let Some(identity) = &binding.object_identity {
+                            propagated
+                                .item
+                                .semantic_contexts
+                                .retain(|context| !context.starts_with("rust_object_identity:"));
+                            propagated
+                                .item
+                                .semantic_contexts
+                                .push(format!("rust_object_identity:{identity}{suffix}"));
+                        } else {
+                            let suffix = format!(
+                                "{}{suffix}",
+                                binding.object_suffix.as_deref().unwrap_or("")
+                            );
+                            if !suffix.is_empty() {
+                                propagated
+                                    .item
+                                    .semantic_contexts
+                                    .push(format!("rust_object_suffix:{suffix}"));
+                            }
+                        }
                         replace_semantic_value_origin(
                             &mut propagated.item.semantic_contexts,
                             binding.origin,
@@ -2904,6 +3755,12 @@ impl<'ast> Visit<'ast> for SemanticDeclarationCollector<'_> {
         if cfg_is_test_only(&node.attrs) {
             return;
         }
+        let namespace = node.ident.to_string();
+        if matches!(namespace.as_str(), "std" | "alloc" | "parking_lot") {
+            self.index
+                .native_namespace_shadows
+                .insert((self.crate_name.clone(), namespace));
+        }
         let Some((_, items)) = &node.content else {
             return;
         };
@@ -2939,6 +3796,7 @@ impl<'ast> Visit<'ast> for SemanticDeclarationCollector<'_> {
             .entry((self.crate_name.clone(), node.ident.to_string()))
             .or_default()
             .push(GlobalTypeBinding {
+                name: node.ident.to_string(),
                 module_path: self.module_path.clone(),
                 ty: node.ty.to_token_stream().to_string(),
             });

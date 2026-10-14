@@ -6,7 +6,7 @@
 //! absence of recognized isolation.  Keeping this predicate independent of
 //! repository, type, and field names makes its coverage auditable.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::types::{
     AccessPattern, ApiUsageEvidenceSet, AtomicAccessKind, CandidateKind, ColocationEvidence,
@@ -82,18 +82,22 @@ pub fn build_pattern_context(
     repetition_evidence: bool,
     protection_excluded: bool,
 ) -> StaticPatternContext {
+    let effective = evidence.map(effective_access_evidence);
+    let evidence = effective.as_ref();
     let access_pattern = classify_access_pattern(evidence, &locations, implicit_write);
     let independently_accessible = colocation_pattern != ColocationPattern::SameObjectFields
-        || has_separable_access_partitions(evidence, &locations)
-        || has_distinct_access_roles(evidence, &locations);
-    let blocked_shared_api = colocation_pattern == ColocationPattern::SameObjectFields
+        || ((has_separable_access_partitions(evidence, &locations)
+            || has_distinct_access_roles(evidence, &locations))
+            && rust_same_object_pair_possible(evidence, &locations));
+    let blocked_shared_api = matches!(colocation_pattern,
+        ColocationPattern::SameObjectFields | ColocationPattern::ContiguousElements)
         && si.is_some_and(|record| record.known_not_sync)
         // A public field can be projected into its own shared reference even
         // when the enclosing object is not Sync.
-        && !si.is_some_and(|record| record.fields.iter().any(|field| field.visibility.is_exposed() && locations.contains(&field.name)))
-        && !si.is_some_and(|record| record.shared_field_projections.iter().any(|field| locations.contains(field)))
+        && !si.is_some_and(|record| record.fields.iter().any(|field| field.visibility.is_exposed() && normalized_location_set(&locations).contains(field.name.as_str())))
+        && !si.is_some_and(|record| record.shared_field_projections.iter().any(|field| normalized_location_set(&locations).contains(field.as_str())))
         && !evidence.into_iter().flat_map(|set| &set.evidence).any(|item| {
-            item.field_name.as_ref().is_some_and(|field| locations.contains(field))
+            item.field_name.as_ref().is_some_and(|field| normalized_location_set(&locations).contains(field.as_str()))
                 && (item.in_concurrent_context || item.through_raw_pointer)
         });
     let parallelism_evidence = if blocked_shared_api {
@@ -128,7 +132,8 @@ pub fn build_pattern_context(
         may_share_cache_line,
         has_write,
         repetition_evidence: repetition_evidence || has_repetition_evidence(evidence, &locations),
-        protection_excluded,
+        protection_excluded: protection_excluded
+            && !rust_common_guard(evidence, &locations, colocation_pattern, si),
         witness_locations: locations,
     })
 }
@@ -172,6 +177,198 @@ pub fn core_predicate_holds(pattern: &StaticPatternContext) -> bool {
         && pattern.may_happen_in_parallel
         && pattern.has_write
         && pattern.protection_excluded
+}
+
+fn effective_access_evidence(evidence: &ConcurrencyEvidenceSet) -> ConcurrencyEvidenceSet {
+    if evidence.evidence.iter().any(|item| {
+        item.semantic_contexts
+            .iter()
+            .any(|context| context == "rust_object_evidence_incomplete")
+    }) {
+        return evidence.clone();
+    }
+    fn source_key(
+        item: &crate::types::EvidenceItem,
+    ) -> (
+        &str,
+        usize,
+        Option<&str>,
+        &EvidenceKind,
+        Option<&AtomicAccessKind>,
+    ) {
+        (
+            item.file.as_str(),
+            item.line,
+            item.field_name.as_deref(),
+            &item.kind,
+            item.access_kind.as_ref(),
+        )
+    }
+    // Index the bounded caller-path suffixes once. A pair check must not scan
+    // every propagated access for every source summary in a large record.
+    let mut instantiated = HashMap::new();
+    for instance in &evidence.evidence {
+        for start in 1..instance.call_path.len() {
+            instantiated
+                .entry((source_key(instance), &instance.call_path[start..]))
+                .and_modify(|depth: &mut usize| *depth = (*depth).max(instance.propagation_depth))
+                .or_insert(instance.propagation_depth);
+        }
+    }
+    let mut effective = evidence.clone();
+    effective.evidence.retain(|item| {
+        item.access_kind.is_none()
+            || item.call_path.is_empty()
+            || item
+                .semantic_contexts
+                .iter()
+                .any(|context| context == "rust_callable_exposed")
+            || instantiated
+                .get(&(source_key(item), item.call_path.as_slice()))
+                .is_none_or(|depth| *depth <= item.propagation_depth)
+    });
+    effective
+}
+
+fn rust_same_object_pair_possible(
+    evidence: Option<&ConcurrencyEvidenceSet>,
+    locations: &[String],
+) -> bool {
+    if evidence.is_some_and(|set| {
+        set.evidence.iter().any(|item| {
+            item.semantic_contexts
+                .iter()
+                .any(|context| context == "rust_object_evidence_incomplete")
+        })
+    }) {
+        return true;
+    }
+    let fields = normalized_location_set(locations)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let items = evidence
+        .into_iter()
+        .flat_map(|set| &set.evidence)
+        .filter(|item| item.access_kind.is_some())
+        .collect::<Vec<_>>();
+    let identity = |item: &crate::types::EvidenceItem| {
+        item.semantic_contexts.iter().find_map(|context| {
+            context
+                .strip_prefix("rust_object_identity:")
+                .map(str::to_owned)
+        })
+    };
+    let role = |item: &crate::types::EvidenceItem| {
+        item.function_name.as_deref().map(|function| {
+            let partitions = item
+                .semantic_contexts
+                .iter()
+                .filter(|context| {
+                    context.starts_with("rust_execution_domain:")
+                        || context.starts_with("control_partition:")
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (item.file.clone(), function.to_owned(), partitions)
+        })
+    };
+    fields.iter().enumerate().any(|(index, left)| {
+        fields.iter().skip(index + 1).any(|right| {
+            let left = items
+                .iter()
+                .filter(|item| item.field_name.as_deref() == Some(*left))
+                .collect::<Vec<_>>();
+            let right = items
+                .iter()
+                .filter(|item| item.field_name.as_deref() == Some(*right))
+                .collect::<Vec<_>>();
+            !left.is_empty()
+                && !right.is_empty()
+                && left.iter().any(|a| {
+                    right.iter().any(|b| {
+                        identity(a).is_none()
+                            || identity(b).is_none()
+                            || (identity(a) == identity(b)
+                                && (role(a).is_none() || role(b).is_none() || role(a) != role(b)))
+                    })
+                })
+        })
+    })
+}
+
+fn rust_common_guard(
+    evidence: Option<&ConcurrencyEvidenceSet>,
+    locations: &[String],
+    topology: ColocationPattern,
+    record: Option<&StructInfo>,
+) -> bool {
+    if evidence.is_some_and(|set| {
+        set.evidence.iter().any(|item| {
+            item.semantic_contexts
+                .iter()
+                .any(|context| context == "rust_object_evidence_incomplete")
+        })
+    }) {
+        return false;
+    }
+    let fields = normalized_location_set(locations);
+    let items = evidence
+        .into_iter()
+        .flat_map(|set| &set.evidence)
+        .filter(|item| {
+            item.access_kind.is_some()
+                && item
+                    .field_name
+                    .as_deref()
+                    .is_some_and(|field| fields.contains(field))
+                && (!item.access_mode.is_exclusive() || item.through_raw_pointer)
+                && !item
+                    .semantic_contexts
+                    .iter()
+                    .any(|context| context == "container_element_pointee")
+        })
+        .collect::<Vec<_>>();
+    if items.is_empty()
+        || fields.iter().any(|field| {
+            !items
+                .iter()
+                .any(|item| item.field_name.as_deref() == Some(field))
+        })
+    {
+        return false;
+    }
+    let guards = |item: &crate::types::EvidenceItem| {
+        item.semantic_contexts
+            .iter()
+            .filter_map(|context| context.strip_prefix("rust_guarded_by:"))
+            .filter(|guard| {
+                guard.starts_with("global:")
+                    || (matches!(
+                        topology,
+                        ColocationPattern::SameObjectFields | ColocationPattern::ContiguousElements
+                    ) && record.is_some_and(|record| {
+                        guard.starts_with(&format!(
+                            "relative:{}:{}:",
+                            record.crate_name.as_deref().unwrap_or("unknown"),
+                            crate::types::StructKey::from_struct(record).qualified_name()
+                        ))
+                    }) && guard
+                        .split_once("value_origin:")
+                        .and_then(|(_, tail)| tail.rsplit_once(':'))
+                        .is_some_and(|(origin, _)| {
+                            item.semantic_contexts
+                                .contains(&format!("value_origin:{origin}"))
+                        }))
+            })
+            .map(str::to_owned)
+            .collect::<HashSet<_>>()
+    };
+    let mut common = guards(items[0]);
+    for item in items.iter().skip(1) {
+        let held = guards(item);
+        common.retain(|guard| held.contains(guard));
+    }
+    !common.is_empty()
 }
 
 /// The topology families each report rule is allowed to represent. Both

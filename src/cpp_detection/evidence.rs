@@ -10892,6 +10892,8 @@ fn collect_field_access_evidence(
                     classify_field_access(line, field).map(|kind| field_access::SyntaxAccess {
                         needs_line_fallback: false,
                         element_member_path: Vec::new(),
+                        object_identity: None,
+                        execution_identity: None,
                         record,
                         field: field.to_string(),
                         kind,
@@ -10999,6 +11001,8 @@ fn collect_field_access_evidence(
                 let record = index.record(record_idx);
                 evidence[record_idx].push_item(CppEvidenceItem {
                     element_member_path: access.element_member_path.clone(),
+                    object_identity: access.object_identity.clone(),
+                    execution_identity: access.execution_identity.clone(),
                     concurrent_call_path: context
                         .concurrent_call_paths
                         .get(&line_no)
@@ -11034,6 +11038,8 @@ fn collect_field_access_evidence(
                 if hotness >= 5.0 && !access.contiguous_element {
                     evidence[record_idx].push_item(CppEvidenceItem {
                         element_member_path: Vec::new(),
+                        object_identity: access.object_identity.clone(),
+                        execution_identity: access.execution_identity.clone(),
                         concurrent_call_path: context
                             .concurrent_call_paths
                             .get(&line_no)
@@ -11085,6 +11091,8 @@ fn collect_field_access_evidence(
                 let record = index.record(record_idx);
                 evidence[record_idx].push_item(CppEvidenceItem {
                     element_member_path: Vec::new(),
+                    object_identity: None,
+                    execution_identity: None,
                     concurrent_call_path: context
                         .concurrent_call_paths
                         .get(&line_no)
@@ -11244,6 +11252,8 @@ fn collect_shared_ownership_evidence(
         let record = index.record(declaration.record_idx);
         evidence[declaration.record_idx].push_item(CppEvidenceItem {
             element_member_path: Vec::new(),
+            object_identity: None,
+            execution_identity: None,
             concurrent_call_path: Vec::new(),
             kind: CppEvidenceKind::SharedOwnership,
             access_kind: None,
@@ -11523,6 +11533,8 @@ fn collect_object_storage_evidence(
             let record = index.record(record_idx);
             evidence[record_idx].push_item(CppEvidenceItem {
                 element_member_path: Vec::new(),
+                object_identity: None,
+                execution_identity: None,
                 concurrent_call_path: Vec::new(),
                 kind,
                 access_kind: None,
@@ -11617,6 +11629,8 @@ fn add_record_wide_concurrency(
         let record = index.record(record_idx);
         evidence[record_idx].push_item(CppEvidenceItem {
             element_member_path: Vec::new(),
+            object_identity: None,
+            execution_identity: None,
             concurrent_call_path: Vec::new(),
             kind: if line.contains("#pragma omp") {
                 CppEvidenceKind::OpenMp

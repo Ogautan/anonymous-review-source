@@ -2700,12 +2700,16 @@ fn field_group_rejects_thread_local_record_access_inside_a_worker() {
         Counters current;
         void * worker(void *) {
             current.hits += 1;
+            return nullptr;
+        }
+        void * other_worker(void *) {
             current.misses += 1;
             return nullptr;
         }
         void start() {
-            pthread_t thread;
+            pthread_t thread, other;
             pthread_create(&thread, nullptr, worker, nullptr);
+            pthread_create(&other, nullptr, other_worker, nullptr);
         }
         "#,
         CandidateKind::FieldGroup,

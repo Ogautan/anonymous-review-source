@@ -5,6 +5,8 @@ use false_sharing_detector::types::RuleId;
 
 fn access(field: &str, kind: CppAccessKind, line: usize) -> CppEvidenceItem {
     CppEvidenceItem {
+        object_identity: None,
+        execution_identity: None,
         element_member_path: Vec::new(),
         concurrent_call_path: vec![],
         kind: CppEvidenceKind::HotScalarWrite,
@@ -168,6 +170,107 @@ fn evidence_budget_prioritizes_field_roles_before_repeated_function_roles() {
             item.field_name.as_deref() == Some("peer") && !item.guard_ids.is_empty()
         })
     );
+}
+
+#[test]
+fn evidence_budget_preserves_nested_paths_before_distinct_object_and_execution_roles() {
+    for peer_first in [false, true] {
+        let mut evidence = CppEvidenceSet::default();
+        let mut peer = access("entries", CppAccessKind::Write, 1000);
+        peer.kind = CppEvidenceKind::ContiguousElementAccess;
+        peer.element_member_path = vec!["right".into(), "value".into()];
+        if peer_first {
+            evidence.push_item(peer.clone());
+        }
+        for line in 0..150 {
+            let mut item = access("entries", CppAccessKind::Write, line);
+            item.kind = CppEvidenceKind::ContiguousElementAccess;
+            item.element_member_path = vec!["left".into(), "value".into()];
+            item.object_identity = Some(format!("object_{line}"));
+            item.execution_identity = Some(format!("worker_{line}"));
+            item.hotness_score = 100.0;
+            evidence.push_item(item);
+        }
+        if !peer_first {
+            evidence.push_item(peer.clone());
+        }
+        // Continue adding execution roles after the sole low-hotness peer.
+        for line in 150..250 {
+            let mut item = access("entries", CppAccessKind::Write, line);
+            item.kind = CppEvidenceKind::ContiguousElementAccess;
+            item.element_member_path = vec!["left".into(), "value".into()];
+            item.execution_identity = Some(format!("worker_{line}"));
+            item.hotness_score = 100.0;
+            evidence.push_item(item);
+        }
+        assert_eq!(evidence.items.len(), 64);
+        assert!(evidence.truncated_items > 0);
+        assert!(
+            evidence
+                .items
+                .iter()
+                .any(|item| item.element_member_path == peer.element_member_path),
+            "lost the sole nested peer, peer_first={peer_first}"
+        );
+        assert!(
+            evidence
+                .items
+                .iter()
+                .any(|item| { item.element_member_path == ["left", "value"] })
+        );
+    }
+}
+
+#[test]
+fn parsed_nested_container_accesses_survive_truncation_without_inventing_accesses() {
+    use false_sharing_detector::cpp_detection::{
+        evidence::collect_cpp_evidence, layout::collect_cpp_structs, parser::parse_cpp_files,
+        types::CppFile,
+    };
+    let repeated = (0..90)
+        .map(|i| {
+            format!(
+                "void work_{i}() {{\nint tid = omp_get_thread_num();\nentries[tid].frequent.fetch_add(1);\n}}\n"
+            )
+        })
+        .collect::<String>();
+    for block in [32, 64, 128] {
+        for late_access in [false, true] {
+            let late = if late_access {
+                "void update(double rare) {\nint tid = omp_get_thread_num();\nif (entries[tid].rare != rare) {\nentries[tid].frequent.fetch_add(1);\nentries[tid].rare = rare;\n}\n}\n"
+            } else {
+                ""
+            };
+            let files = parse_cpp_files(vec![CppFile {
+                path: "owner.hpp".into(),
+                source: format!(
+                    "struct Entry {{\nstd::atomic<int> frequent;\ndouble rare;\n}};\nstruct Owner {{\nstd::vector<Entry> entries;\n{repeated}{late}\n}};\n"
+                ),
+            }]);
+            let records = collect_cpp_structs(&files, "fixture", block);
+            let facts = collect_cpp_evidence(&files, &records);
+            let owner = records
+                .iter()
+                .position(|record| record.name == "Owner")
+                .unwrap();
+            let evidence = &facts[owner];
+            assert!(evidence.truncated_items > 0);
+            assert!(evidence.items.len() <= 64);
+            assert!(evidence.items.iter().any(|item| {
+                item.field_name.as_deref() == Some("entries")
+                    && item.element_member_path == ["frequent"]
+            }));
+            assert_eq!(
+                evidence.items.iter().any(|item| {
+                    item.field_name.as_deref() == Some("entries")
+                        && item.element_member_path == ["rare"]
+                        && item.access_kind == Some(CppAccessKind::Write)
+                }),
+                late_access,
+                "B={block}, late_access={late_access}"
+            );
+        }
+    }
 }
 
 #[test]

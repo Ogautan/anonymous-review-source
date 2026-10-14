@@ -417,6 +417,8 @@ fn apply_access_facts(
         });
         set.push_item(CppEvidenceItem {
             element_member_path: Vec::new(),
+            object_identity: None,
+            execution_identity: None,
             concurrent_call_path: Vec::new(),
             kind: CppEvidenceKind::CompilerSemanticAccess,
             access_kind: Some(access_kind),
@@ -553,6 +555,8 @@ mod tests {
         let mut evidence = vec![CppEvidenceSet::default()];
         evidence[0].push_item(CppEvidenceItem {
             element_member_path: Vec::new(),
+            object_identity: None,
+            execution_identity: None,
             concurrent_call_path: Vec::new(),
             kind: CppEvidenceKind::HotScalarWrite,
             access_kind: Some(CppAccessKind::Write),

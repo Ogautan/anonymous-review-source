@@ -227,6 +227,17 @@ pub fn retain_theory_candidates(
                 .collect::<HashSet<_>>()
                 .len()
                 >= 2;
+        let independently_accessible = independently_accessible
+            && (topology != ColocationPattern::SameObjectFields
+                || evidence.is_some_and(|set| set.truncated_items > 0)
+                || {
+                    let fields = candidate_fields.iter().copied().collect::<Vec<_>>();
+                    fields.iter().enumerate().any(|(index, left)| {
+                        fields.iter().skip(index + 1).any(|right| {
+                            same_object_accesses_may_alias(&matching_items, left, right)
+                        })
+                    })
+                });
         let parallelism = cpp_parallelism(
             finding.candidate_kind,
             topology,
@@ -555,6 +566,38 @@ fn candidate_field_names(locations: &[String]) -> HashSet<&str> {
         .collect()
 }
 
+pub(super) fn same_object_accesses_may_alias(
+    items: &[&super::types::CppEvidenceItem],
+    left: &str,
+    right: &str,
+) -> bool {
+    let selected = |field: &str| {
+        items
+            .iter()
+            .copied()
+            .filter(|item| item.access_kind.is_some() && item.field_name.as_deref() == Some(field))
+            .collect::<Vec<_>>()
+    };
+    let left = selected(left);
+    let right = selected(right);
+    // Unknown aliases remain may-alias. Different pointer names alone do not
+    // prove that their pointees are different object instances.
+    left.is_empty()
+        || right.is_empty()
+        || left
+            .iter()
+            .chain(&right)
+            .any(|item| item.object_identity.is_none())
+        || left.iter().any(|a| {
+            right.iter().any(|b| {
+                a.object_identity == b.object_identity
+                    && (a.execution_identity.is_none()
+                        || b.execution_identity.is_none()
+                        || a.execution_identity != b.execution_identity)
+            })
+        })
+}
+
 fn has_separable_cpp_accesses(items: &[&super::types::CppEvidenceItem]) -> bool {
     cpp_access_roles_separable(items, false, &[])
 }
@@ -577,7 +620,7 @@ fn cpp_access_roles_separable(
 ) -> bool {
     // File is part of callable identity: unrelated same-spelled functions in
     // separate translation units must not be merged into one access role.
-    let mut by_function: HashMap<(&str, &str), HashMap<&str, bool>> = HashMap::new();
+    let mut by_function: HashMap<(&str, &str, Option<&str>), HashMap<&str, bool>> = HashMap::new();
     for item in items {
         let (Some(function), Some(field), Some(kind)) = (
             item.function_name.as_deref(),
@@ -588,7 +631,7 @@ fn cpp_access_roles_separable(
         };
         let written = matches!(kind, CppAccessKind::Write | CppAccessKind::ReadModifyWrite);
         *by_function
-            .entry((&item.file, function))
+            .entry((&item.file, function, item.execution_identity.as_deref()))
             .or_default()
             .entry(field)
             .or_default() |= written;
@@ -596,8 +639,10 @@ fn cpp_access_roles_separable(
     // Only complete the membership of roles already witnessed by real retained
     // accesses. An omitted function cannot create a new independent role.
     for role in omitted {
-        if let Some(fields) = by_function.get_mut(&(role.file.as_str(), role.function.as_str())) {
-            *fields.entry(&role.field).or_default() |= role.written;
+        for ((file, function, _), fields) in &mut by_function {
+            if *file == role.file && *function == role.function {
+                *fields.entry(&role.field).or_default() |= role.written;
+            }
         }
     }
     let partitions = by_function.values().collect::<Vec<_>>();
